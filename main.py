@@ -53,8 +53,9 @@ materials.append(sph_3_mat)
 
 world = World(spheres, materials)
 cam = Camera(world)
-# Adapt grid to scene AABB
-cam.adapt_grid_to_scene(spheres)
+# Adapt grid to scene AABB with verbose output
+print("Initializing irradiance grid...")
+cam.adapt_grid_to_scene(spheres, verbose=True)
 
 # Identify large spheres (to monitor for movement) and store previous centers
 big_indices = []
@@ -90,7 +91,8 @@ def main():
 
             # If any big sphere moved, re-adapt grid to scene bounds
             if len(moved_indices) > 0:
-                cam.adapt_grid_to_scene(spheres)
+                print(f"Frame {rendered_frames}: Large sphere moved, re-adapting grid...")
+                cam.adapt_grid_to_scene(spheres, verbose=True)
 
         # Reset weights to 1.0
         for i in range(cam.grid_res[0]):
@@ -130,7 +132,7 @@ def main():
         gui.set_image(current_frame)
         gui.show()
         rendered_frames += 1
-    ti.tools.imwrite(current_frame, "output.png")
+    ti.tools.imwrite(current_frame, "output(32x32x32)caizhifenliu.png")
 
 @ti.kernel
 def average_frames(current_frame: ti.template(), new_frame: ti.template(), weight: float):

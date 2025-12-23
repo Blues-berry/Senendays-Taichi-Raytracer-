@@ -57,7 +57,7 @@ class Camera:
         self.frame = ti.Vector.field(n=3, dtype=ti.f32, shape=self.img_res)
 
         # Irradiance grid for storing spatial lighting information
-        self.grid_res = (16, 16, 16)
+        self.grid_res = (32, 32, 32)
         # Define grid origin and cell size (world-space AABB)
         self.grid_origin = vec3(-8.0, -1.0, -8.0)
         self.grid_cell_size = 1.0
@@ -85,70 +85,148 @@ class Camera:
         return self.camera_origin + self.defocus_disk_u * p[0] + self.defocus_disk_v * p[1]
 
     @ti.func
-    def get_ray_color(self, ray: Ray, world: ti.template()) -> vec3:
-        # Single-step: trace to first surface and sample irradiance grid
-        hit = world.hit_world(ray, 0.001, tm.inf)
-        color = vec3(0.0, 0.0, 0.0)
-        if hit.did_hit:
-            p = hit.record.p
-            # Map world position to grid-space continuous coordinates
-            local = p - self.grid_origin
-            fx = local[0] / self.grid_cell_size
-            fy = local[1] / self.grid_cell_size
-            fz = local[2] / self.grid_cell_size
+    def sample_irradiance_grid(self, p: vec3, world: ti.template(), fallback_id: int) -> vec3:
+        # Map world position to grid-space continuous coordinates
+        local = p - self.grid_origin
+        fx = local[0] / self.grid_cell_size
+        fy = local[1] / self.grid_cell_size
+        fz = local[2] / self.grid_cell_size
 
-            # integer base indices
-            ix0 = int(ti.floor(fx))
-            iy0 = int(ti.floor(fy))
-            iz0 = int(ti.floor(fz))
+        # integer base indices
+        ix0 = int(ti.floor(fx))
+        iy0 = int(ti.floor(fy))
+        iz0 = int(ti.floor(fz))
 
-            # fractional part
-            tx = fx - ix0
-            ty = fy - iy0
-            tz = fz - iz0
+        # fractional part
+        tx = fx - ix0
+        ty = fy - iy0
+        tz = fz - iz0
 
-            # clamp base indices so ix1 = ix0+1 is valid
-            nx = self.grid_res[0]
-            ny = self.grid_res[1]
-            nz = self.grid_res[2]
-            if ix0 < 0:
-                ix0 = 0
-                tx = 0.0
-            if iy0 < 0:
-                iy0 = 0
-                ty = 0.0
-            if iz0 < 0:
-                iz0 = 0
-                tz = 0.0
-            if ix0 >= nx - 1 or iy0 >= ny - 1 or iz0 >= nz - 1:
-                # Outside or on the border: fallback to material albedo
-                color = world.materials.albedo[hit.record.id]
-            else:
-                ix1 = ix0 + 1
-                iy1 = iy0 + 1
-                iz1 = iz0 + 1
-
-                # fetch the 8 neighbors
-                c000 = self.irradiance_grid[ix0, iy0, iz0]
-                c100 = self.irradiance_grid[ix1, iy0, iz0]
-                c010 = self.irradiance_grid[ix0, iy1, iz0]
-                c110 = self.irradiance_grid[ix1, iy1, iz0]
-                c001 = self.irradiance_grid[ix0, iy0, iz1]
-                c101 = self.irradiance_grid[ix1, iy0, iz1]
-                c011 = self.irradiance_grid[ix0, iy1, iz1]
-                c111 = self.irradiance_grid[ix1, iy1, iz1]
-
-                # trilinear interpolation
-                c00 = c000 * (1.0 - tx) + c100 * tx
-                c10 = c010 * (1.0 - tx) + c110 * tx
-                c01 = c001 * (1.0 - tx) + c101 * tx
-                c11 = c011 * (1.0 - tx) + c111 * tx
-
-                c0 = c00 * (1.0 - ty) + c10 * ty
-                c1 = c01 * (1.0 - ty) + c11 * ty
-
-                color = c0 * (1.0 - tz) + c1 * tz
+        # clamp base indices so ix1 = ix0+1 is valid
+        nx = self.grid_res[0]
+        ny = self.grid_res[1]
+        nz = self.grid_res[2]
+        color = vec3(0.0)
+        if ix0 < 0 or ix0 >= nx - 1 or iy0 < 0 or iy0 >= ny - 1 or iz0 < 0 or iz0 >= nz - 1:
+            # Outside or on the border: fallback to material albedo
+            color = world.materials.albedo[fallback_id]
         else:
+            ix1 = ix0 + 1
+            iy1 = iy0 + 1
+            iz1 = iz0 + 1
+
+            # fetch the 8 neighbors
+            c000 = self.irradiance_grid[ix0, iy0, iz0]
+            c100 = self.irradiance_grid[ix1, iy0, iz0]
+            c010 = self.irradiance_grid[ix0, iy1, iz0]
+            c110 = self.irradiance_grid[ix1, iy1, iz0]
+            c001 = self.irradiance_grid[ix0, iy0, iz1]
+            c101 = self.irradiance_grid[ix1, iy0, iz1]
+            c011 = self.irradiance_grid[ix0, iy1, iz1]
+            c111 = self.irradiance_grid[ix1, iy1, iz1]
+
+            # trilinear interpolation
+            c00 = c000 * (1.0 - tx) + c100 * tx
+            c10 = c010 * (1.0 - tx) + c110 * tx
+            c01 = c001 * (1.0 - tx) + c101 * tx
+            c11 = c011 * (1.0 - tx) + c111 * tx
+
+            c0 = c00 * (1.0 - ty) + c10 * ty
+            c1 = c01 * (1.0 - ty) + c11 * ty
+
+            color = c0 * (1.0 - tz) + c1 * tz
+        return color
+
+    # === Path Tracing (Ground-Truth) ===
+    @ti.func
+    def get_ray_color_pt(self, ray: Ray, world: ti.template()) -> vec3:
+        """经典递归/迭代 Path Tracing，不使用光照网格，用作真值。"""
+        attenuation = vec3(1.0)
+        current_ray = ray
+        color = vec3(0.0)
+        for _ in range(self.max_ray_depth):
+            hit = world.hit_world(current_ray, 0.001, tm.inf)
+            if hit.did_hit:
+                scatter_ret = world.materials.scatter(current_ray, hit.record)
+                if scatter_ret.did_scatter:
+                    attenuation *= scatter_ret.attenuation
+                    current_ray = Ray(origin=scatter_ret.scattered.origin + tm.normalize(scatter_ret.scattered.direction) * 0.0002,
+                                      direction=scatter_ret.scattered.direction)
+                else:
+                    # 吸收
+                    break
+            else:
+                # 抵达背景
+                unit_direction = current_ray.direction.normalized()
+                a = 0.5 * (unit_direction[1] + 1.0)
+                env = (1.0 - a) * vec3(1.0, 1.0, 1.0) + a * vec3(0.5, 0.7, 1.0)
+                color = attenuation * env
+                break
+        return color
+
+    # === 纯网格模式 ===
+    @ti.func
+    def get_ray_color_grid(self, ray: Ray, world: ti.template()) -> vec3:
+        hit = world.hit_world(ray, 0.001, tm.inf)
+        if hit.did_hit:
+            return self.sample_irradiance_grid(hit.record.p, world, hit.record.id)
+        else:
+            unit_direction = ray.direction.normalized()
+            a = 0.5 * (unit_direction[1] + 1.0)
+            return (1.0 - a) * vec3(1.0, 1.0, 1.0) + a * vec3(0.5, 0.7, 1.0)
+
+    # === 混合模式（自适应） ===
+    @ti.func
+    def get_ray_color_hybrid(self, ray: Ray, world: ti.template()) -> vec3:
+        color = vec3(0.0, 0.0, 0.0)
+        hit = world.hit_world(ray, 0.001, tm.inf)
+
+        if hit.did_hit:
+            mat_idx = world.materials.mat_index[hit.record.id]
+
+            # Sample grid for ambient term or primary color
+            grid_color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id)
+
+            if mat_idx == world.materials.LAMBERT:
+                # For Lambertian, the color is primarily from the grid
+                color = grid_color
+            else:  # Metal or Dielectric
+                # For specular materials, trace further and add ambient term
+                bounced_color = vec3(0.0)
+                attenuation = vec3(1.0)
+                current_ray = ray
+                current_hit_record = hit.record
+
+                # Perform 1-2 bounces for reflections
+                for i in range(2):
+                    scatter_ret = world.materials.scatter(current_ray, current_hit_record)
+                    if scatter_ret.did_scatter:
+                        attenuation *= scatter_ret.attenuation
+                        current_ray = scatter_ret.scattered
+                        bounce_hit = world.hit_world(current_ray, 0.001, tm.inf)
+                        if bounce_hit.did_hit:
+                            current_hit_record = bounce_hit.record
+                            # If the bounce hits a diffuse surface, sample grid and terminate
+                            if world.materials.mat_index[bounce_hit.record.id] == world.materials.LAMBERT:
+                                bounced_color = attenuation * self.sample_irradiance_grid(bounce_hit.record.p, world, bounce_hit.record.id)
+                                break
+                        else:
+                            # Ray escaped to background
+                            unit_direction = current_ray.direction.normalized()
+                            a = 0.5 * (unit_direction[1] + 1.0)
+                            background = (1.0 - a) * vec3(1.0, 1.0, 1.0) + a * vec3(0.5, 0.7, 1.0)
+                            bounced_color = attenuation * background
+                            break
+                    else:
+                        # Absorbed
+                        bounced_color = vec3(0.0)
+                        break
+
+                # Final color is the traced reflection plus a small ambient contribution from the grid
+                ambient_contribution = 0.15
+                color = bounced_color + grid_color * ambient_contribution
+        else:
+            # Background color
             unit_direction = ray.direction.normalized()
             a = 0.5 * (unit_direction[1] + 1.0)
             color = (1.0 - a) * vec3(1.0, 1.0, 1.0) + a * vec3(0.5, 0.7, 1.0)
@@ -238,31 +316,65 @@ class Camera:
 
     @ti.kernel
     def blur_update_weights(self):
-        # Simple 1-step neighbor blur: center 0.5, 6-axis neighbors 0.08333 each
-        for i, j, k in ti.ndrange(self.grid_res[0], self.grid_res[1], self.grid_res[2]):
-            center = self.grid_update_weight[i, j, k]
-            s = 0.5 * center
-            w = 0.08333333333333333
-            # accumulate axis-aligned neighbors
-            if i - 1 >= 0:
-                s += w * self.grid_update_weight[i - 1, j, k]
-            if i + 1 < self.grid_res[0]:
-                s += w * self.grid_update_weight[i + 1, j, k]
-            if j - 1 >= 0:
-                s += w * self.grid_update_weight[i, j - 1, k]
-            if j + 1 < self.grid_res[1]:
-                s += w * self.grid_update_weight[i, j + 1, k]
-            if k - 1 >= 0:
-                s += w * self.grid_update_weight[i, j, k - 1]
-            if k + 1 < self.grid_res[2]:
-                s += w * self.grid_update_weight[i, j, k + 1]
-            self.grid_update_weight_tmp[i, j, k] = s
+        # Gaussian blur with 3x3x3 kernel for smoother weight transitions
+        # Using approximate Gaussian weights:
+        # - Center: 0.4
+        # - Face neighbors (6): 0.06 each
+        # - Edge neighbors (12): 0.02 each
+        # - Corner neighbors (8): 0.01 each
+        # Total ≈ 1.0 for normalization
 
-        # copy back
+        for i, j, k in ti.ndrange(self.grid_res[0], self.grid_res[1], self.grid_res[2]):
+            s = 0.0
+            total_weight = 0.0
+
+            # 3x3x3 neighborhood
+            for di in ti.static(range(-1, 2)):
+                for dj in ti.static(range(-1, 2)):
+                    for dk in ti.static(range(-1, 2)):
+                        ni = i + di
+                        nj = j + dj
+                        nk = k + dk
+
+                        # Check bounds
+                        if 0 <= ni < self.grid_res[0] and 0 <= nj < self.grid_res[1] and 0 <= nk < self.grid_res[2]:
+                            # Calculate Gaussian weight based on distance
+                            dist_sq = di * di + dj * dj + dk * dk
+                            w = 0.0
+                            if dist_sq == 0:
+                                # Center
+                                w = 0.4
+                            elif dist_sq == 1:
+                                # Face neighbors (6 total)
+                                w = 0.06
+                            elif dist_sq == 2:
+                                # Edge neighbors (12 total)
+                                w = 0.02
+                            elif dist_sq == 3:
+                                # Corner neighbors (8 total)
+                                w = 0.01
+
+                            s += w * self.grid_update_weight[ni, nj, nk]
+                            total_weight += w
+
+            # Normalize to prevent weight drift
+            if total_weight > 0.0:
+                self.grid_update_weight_tmp[i, j, k] = s / total_weight
+            else:
+                self.grid_update_weight_tmp[i, j, k] = self.grid_update_weight[i, j, k]
+
+        # Copy back
         for i, j, k in ti.ndrange(self.grid_res[0], self.grid_res[1], self.grid_res[2]):
             self.grid_update_weight[i, j, k] = self.grid_update_weight_tmp[i, j, k]
 
-    def adapt_grid_to_scene(self, spheres: ti.template()):
+    def adapt_grid_to_scene(self, spheres: ti.template(), verbose: bool = False):
+        """
+        Automatically compute and adapt the irradiance grid to tightly fit the scene AABB.
+
+        Args:
+            spheres: List of Sphere objects in the scene
+            verbose: If True, print diagnostic information about the grid adaptation
+        """
         # Compute scene AABB from sphere centers and radii (Python-side)
         # spheres is a Python list of Sphere objects
         # find min and max
@@ -301,8 +413,8 @@ class Camera:
                 if cz + r > max_z:
                     max_z = cz + r
 
-        # pad slightly
-        pad = 0.1
+        # pad slightly to avoid boundary issues
+        pad = 0.5  # Increased padding for better coverage
         min_x -= pad
         min_y -= pad
         min_z -= pad
@@ -329,3 +441,14 @@ class Camera:
         # set origin to min corner
         self.grid_origin = vec3(min_x, min_y, min_z)
         self.grid_cell_size = cell
+
+        if verbose:
+            print(f"\n=== Grid Adaptation ===")
+            print(f"Scene AABB: ({min_x:.2f}, {min_y:.2f}, {min_z:.2f}) to ({max_x:.2f}, {max_y:.2f}, {max_z:.2f})")
+            print(f"Scene dimensions: {dx:.2f} x {dy:.2f} x {dz:.2f}")
+            print(f"Grid resolution: {nx} x {ny} x {nz}")
+            print(f"Grid origin: ({min_x:.2f}, {min_y:.2f}, {min_z:.2f})")
+            print(f"Cell size: {cell:.4f}")
+            print(f"Grid coverage: {nx*cell:.2f} x {ny*cell:.2f} x {nz*cell:.2f}")
+            print(f"Total spheres: {len(spheres)}")
+            print("=====================\n")

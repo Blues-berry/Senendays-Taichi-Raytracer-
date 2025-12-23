@@ -53,6 +53,8 @@ materials.append(sph_3_mat)
 
 world = World(spheres, materials)
 cam = Camera(world)
+# Adapt grid to scene AABB
+cam.adapt_grid_to_scene(spheres)
 
 # Identify large spheres (to monitor for movement) and store previous centers
 big_indices = []
@@ -86,6 +88,10 @@ def main():
                 moved_indices.append(idx)
                 prev_centers[idx_i] = cur_center
 
+            # If any big sphere moved, re-adapt grid to scene bounds
+            if len(moved_indices) > 0:
+                cam.adapt_grid_to_scene(spheres)
+
         # Reset weights to 1.0
         for i in range(cam.grid_res[0]):
             for j in range(cam.grid_res[1]):
@@ -111,6 +117,10 @@ def main():
                         dz = posz - cz
                         if dx * dx + dy * dy + dz * dz <= influence * influence:
                             cam.grid_update_weight[i, j, k] = cam.grid_update_weight[i, j, k] * 3.0
+
+        # After boosting, smooth weights to avoid hard seams
+        if len(moved_indices) > 0:
+            cam.blur_update_weights()
 
         # Perform adaptive grid updates (base 5% per frame)
         cam.update_grid(world, 0.05)

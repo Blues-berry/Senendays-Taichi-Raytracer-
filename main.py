@@ -93,6 +93,7 @@ def main():
     # Monitoring / automation variables
     fps_tick_start = time.perf_counter()
     fps_tick_count = 0
+    last_frame_time = time.perf_counter()
     move_count = 0
     last_move_frame = -1000
     recovery_monitoring = False
@@ -177,6 +178,12 @@ def main():
         rendered_frames += 1
         fps_tick_count += 1
 
+        # instantaneous FPS measurement
+        now_frame = time.perf_counter()
+        frame_time = now_frame - last_frame_time
+        fps = (1.0 / frame_time) if frame_time > 0.0 else 0.0
+        last_frame_time = now_frame
+
         # Every 100 frames, print average FPS and grid memory usage
         if fps_tick_count >= 100:
             now = time.perf_counter()
@@ -184,7 +191,7 @@ def main():
             avg_fps = fps_tick_count / elapsed if elapsed > 0 else 0.0
             nx, ny, nz = cam.grid_res
             grid_mem_mb = float(nx * ny * nz * 3 * 4) / (1024.0 * 1024.0)
-            print(f"[Stats] Frame {rendered_frames}: Avg FPS={avg_fps:.2f}, Grid mem={grid_mem_mb:.2f} MB")
+            print(f"[Stats] Frame {rendered_frames}: Avg FPS={avg_fps:.5f}, Grid mem={grid_mem_mb:.5f} MB")
             fps_tick_start = now
             fps_tick_count = 0
 
@@ -237,8 +244,7 @@ def main():
         try:
             with open(log_path, 'a', newline='') as f:
                 w = csv.writer(f)
-                # Use instantaneous FPS estimate (could be refined)
-                w.writerow([rendered_frames, render_mode, f"{0:.2f}", f"{mse:.8e}"])
+                w.writerow([rendered_frames, render_mode, f"{fps:.2f}", f"{mse:.8e}"])
         except Exception as e:
             print(f"Failed to write log: {e}")
 

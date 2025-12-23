@@ -151,8 +151,9 @@ def experiment_main():
         # Update grid (5% base update rate)
         cam.update_grid(world, 0.05)
         
-        # Render frame
-        cam.render(world)
+        # Render frame (mode: adaptive if enabled, else grid)
+        mode_int = 2 if use_adaptive_logic else 1
+        cam.render(world, mode_int)
         
         # Update frame buffer
         weight = 1.0 / (frame_count + 1)

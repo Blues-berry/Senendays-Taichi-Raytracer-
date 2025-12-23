@@ -6,8 +6,13 @@ import material
 import utils
 import random
 import time
+import os
+import csv
 
-ti.init(arch=ti.gpu)
+# Initialize Taichi with fixed RNG seed for reproducibility
+ti.init(arch=ti.gpu, random_seed=42)
+# Seed Python RNG for deterministic scene generation
+random.seed(42)
 
 vec3 = ti.types.vector(3, float)
 spheres = []
@@ -18,6 +23,7 @@ floor_mat = material.Lambert(vec3(0.5, 0.5, 0.5))
 spheres.append(floor)
 materials.append(floor_mat)
 
+# Small spheres grid (deterministic via seeded RNG above)
 for a in range(-11, 11):
     for b in range(-11, 11):
         choose_mat = random.random()
@@ -65,6 +71,17 @@ for i, s in enumerate(spheres):
         big_indices.append(i)
         prev_centers.append(s.center)
 
+# Experiment control
+render_mode = 'Adaptive'  # options: 'PT', 'Grid', 'Adaptive'
+mode_map = {'PT': 0, 'Grid': 1, 'Adaptive': 2}
+
+# Ensure experiment log exists and has header
+log_path = 'experiment_log.csv'
+if not os.path.exists(log_path):
+    with open(log_path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['frame_index', 'mode', 'FPS', 'MSE'])
+
 def main():
     # start_time = time.perf_counter()
     # print(f"Rendering time: {time.perf_counter() - start_time:.2f}s")
@@ -72,7 +89,19 @@ def main():
     gui = ti.GUI('Taichi Raytracing', cam.img_res, fast_gui=True)
     current_frame = ti.Vector.field(n=3, dtype=ti.f32, shape=cam.img_res)
     rendered_frames = 0
-    while gui.running and rendered_frames < 200:
+
+    # Monitoring / automation variables
+    fps_tick_start = time.perf_counter()
+    fps_tick_count = 0
+    move_count = 0
+    last_move_frame = -1000
+    recovery_monitoring = False
+    recovery_start_frame = 0
+    consecutive_small = 0
+    last_mse = None
+
+    # Run indefinitely (or until GUI closed)
+    while gui.running:
         weight = 1.0 / (rendered_frames + 1)
         # Detect large-sphere movement and boost nearby grid update probability if moved
         moved_indices = []
@@ -124,14 +153,96 @@ def main():
         if len(moved_indices) > 0:
             cam.blur_update_weights()
 
-        # Perform adaptive grid updates (base 5% per frame)
-        cam.update_grid(world, 0.05)
+        # Mode-specific behavior
+        mode_int = mode_map.get(render_mode, 2)
 
-        cam.render(world)
+        if render_mode == 'PT':
+            # Pure path tracing (no grid updates)
+            cam.render(world, mode_int)
+        elif render_mode == 'Grid':
+            # Grid-only with fixed 5% update
+            cam.update_grid(world, 0.05)
+            cam.render(world, mode_int)
+        else:
+            # Adaptive hybrid: we updated weights above, apply base 5% updates
+            cam.update_grid(world, 0.05)
+            cam.render(world, mode_int)
+
+        # Average into display buffer (gamma conversion handled inside)
         average_frames(current_frame, cam.frame, weight)
         gui.set_image(current_frame)
         gui.show()
+
+        # --- Experiment automation bookkeeping ---
         rendered_frames += 1
+        fps_tick_count += 1
+
+        # Every 100 frames, print average FPS and grid memory usage
+        if fps_tick_count >= 100:
+            now = time.perf_counter()
+            elapsed = now - fps_tick_start
+            avg_fps = fps_tick_count / elapsed if elapsed > 0 else 0.0
+            nx, ny, nz = cam.grid_res
+            grid_mem_mb = float(nx * ny * nz * 3 * 4) / (1024.0 * 1024.0)
+            print(f"[Stats] Frame {rendered_frames}: Avg FPS={avg_fps:.2f}, Grid mem={grid_mem_mb:.2f} MB")
+            fps_tick_start = now
+            fps_tick_count = 0
+
+        # Dynamic displacement every 200 frames: move primary large sphere along X by +0.5
+        if rendered_frames % 200 == 0:
+            if len(big_indices) > 0:
+                idx = big_indices[0]
+                spheres[idx].center[0] = spheres[idx].center[0] + 0.5
+                prev_centers[0] = spheres[idx].center
+                print(f"[Move] Frame {rendered_frames}: moved big sphere {idx} by +0.5 on X")
+                cam.adapt_grid_to_scene(spheres, verbose=True)
+                move_count += 1
+                last_move_frame = rendered_frames
+                # start monitoring recovery
+                recovery_monitoring = True
+                recovery_start_frame = rendered_frames
+                consecutive_small = 0
+                last_mse = None
+
+        # Render PT baseline for MSE comparison (single-sample PT)
+        cam.render_pt(world)
+        mse = cam.compute_mse()
+
+        # Recovery detection: after a move, look for 5 consecutive frames with <0.1% relative MSE change
+        if recovery_monitoring:
+            if last_mse is None:
+                last_mse = mse
+                consecutive_small = 0
+            else:
+                rel = abs(mse - last_mse) / (abs(last_mse) + 1e-12)
+                if rel < 0.001:
+                    consecutive_small += 1
+                else:
+                    consecutive_small = 0
+                last_mse = mse
+                if consecutive_small >= 5:
+                    recovery_frames = rendered_frames - recovery_start_frame
+                    print(f"[Recovery] move #{move_count} recovered in {recovery_frames} frames")
+                    recovery_monitoring = False
+
+        # Timed screenshots at move+5 and move+50
+        if last_move_frame >= 0:
+            rel_frame = rendered_frames - last_move_frame
+            if rel_frame == 5 or rel_frame == 50:
+                filename = f"{render_mode}_move_{move_count}_frame_{rel_frame}.png"
+                ti.tools.imwrite(current_frame, filename)
+                print(f"Saved screenshot: {filename}")
+
+        # Append per-frame data to CSV log
+        try:
+            with open(log_path, 'a', newline='') as f:
+                w = csv.writer(f)
+                # Use instantaneous FPS estimate (could be refined)
+                w.writerow([rendered_frames, render_mode, f"{0:.2f}", f"{mse:.8e}"])
+        except Exception as e:
+            print(f"Failed to write log: {e}")
+
+    # Save last displayed image on exit
     ti.tools.imwrite(current_frame, "output(32x32x32)caizhifenliu.png")
 
 @ti.kernel

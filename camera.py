@@ -55,6 +55,10 @@ class Camera:
         self.defocus_disk_v = v * defocus_radius
 
         self.frame = ti.Vector.field(n=3, dtype=ti.f32, shape=self.img_res)
+        # store a PT baseline frame for MSE comparisons
+        self.pt_frame = ti.Vector.field(n=3, dtype=ti.f32, shape=self.img_res)
+        # accumulator for MSE kernel
+        self._mse_acc = ti.field(dtype=ti.f32, shape=())
 
         # Irradiance grid for storing spatial lighting information
         self.grid_res = (32, 32, 32)
@@ -70,14 +74,40 @@ class Camera:
         self.grid_update_weight.fill(1.0)
 
     @ti.kernel
-    def render(self, world: ti.template()):
-        # Main rendering loop
+    def render(self, world: ti.template(), mode: ti.i32):
+        # Main rendering loop, mode: 0=PT, 1=Grid, 2=Adaptive
         for x, y in self.frame:
             pixel_color = vec3(0, 0, 0)
             for _ in range(self.samples_per_pixel):
                 view_ray = self.get_ray(x, y)
-                pixel_color += self.get_ray_color(view_ray, world) / self.samples_per_pixel
+                if mode == 0:
+                    pixel_color += self.get_ray_color_pt(view_ray, world) / self.samples_per_pixel
+                elif mode == 1:
+                    pixel_color += self.get_ray_color_grid(view_ray, world) / self.samples_per_pixel
+                else:
+                    pixel_color += self.get_ray_color_hybrid(view_ray, world) / self.samples_per_pixel
             self.frame[x, y] = pixel_color
+
+    @ti.kernel
+    def render_pt(self, world: ti.template()):
+        # Render a single-sample PT baseline into pt_frame
+        for x, y in self.pt_frame:
+            self.pt_frame[x, y] = self.get_ray_color_pt(self.get_ray(x, y), world)
+
+    @ti.kernel
+    def compute_mse(self) -> ti.f32:
+        # Computes MSE between current `frame` and `pt_frame` (linear values)
+        self._mse_acc[None] = 0.0
+        for i, j in self.frame:
+            a = self.frame[i, j]
+            b = self.pt_frame[i, j]
+            for c in ti.static(range(3)):
+                diff = a[c] - b[c]
+                # atomic add to accumulator
+                self._mse_acc[None] += diff * diff
+        # normalize
+        denom = float(self.img_res[0] * self.img_res[1] * 3)
+        return self._mse_acc[None] / denom
 
     @ti.func
     def defocus_disk_sample(self):
@@ -168,12 +198,14 @@ class Camera:
     @ti.func
     def get_ray_color_grid(self, ray: Ray, world: ti.template()) -> vec3:
         hit = world.hit_world(ray, 0.001, tm.inf)
+        color = vec3(0.0)
         if hit.did_hit:
-            return self.sample_irradiance_grid(hit.record.p, world, hit.record.id)
+            color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id)
         else:
             unit_direction = ray.direction.normalized()
             a = 0.5 * (unit_direction[1] + 1.0)
-            return (1.0 - a) * vec3(1.0, 1.0, 1.0) + a * vec3(0.5, 0.7, 1.0)
+            color = (1.0 - a) * vec3(1.0, 1.0, 1.0) + a * vec3(0.5, 0.7, 1.0)
+        return color
 
     # === 混合模式（自适应） ===
     @ti.func

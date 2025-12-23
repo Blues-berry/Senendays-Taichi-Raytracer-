@@ -100,6 +100,8 @@ def main():
     recovery_start_frame = 0
     consecutive_small = 0
     last_mse = None
+    # buffered log writes to avoid per-frame IO
+    logs_buffer = []
 
     # Run indefinitely (or until GUI closed)
     while gui.running:
@@ -112,7 +114,8 @@ def main():
             # compare components; if changed, mark moved
             moved = False
             for t in range(3):
-                if abs(cur_center[t] - prev[t]) > 1e-5:
+                # only consider meaningful movement above threshold to avoid noisy triggers
+                if abs(cur_center[t] - prev[t]) > 0.01:
                     moved = True
                     break
             if moved:
@@ -124,31 +127,14 @@ def main():
                 print(f"Frame {rendered_frames}: Large sphere moved, re-adapting grid...")
                 cam.adapt_grid_to_scene(spheres, verbose=True)
 
-        # Reset weights to 1.0
-        for i in range(cam.grid_res[0]):
-            for j in range(cam.grid_res[1]):
-                for k in range(cam.grid_res[2]):
-                    cam.grid_update_weight[i, j, k] = 1.0
+        # Reset weights to 1.0 using Taichi field fill (avoids expensive Python loops)
+        cam.grid_update_weight.fill(1.0)
 
-        # Boost weights in regions near moved big spheres
+        # Boost weights in regions near moved big spheres via Taichi kernel (GPU-side)
         for midx in moved_indices:
             center = spheres[midx].center
             influence = spheres[midx].radius * 3.0
-            for i in range(cam.grid_res[0]):
-                for j in range(cam.grid_res[1]):
-                    for k in range(cam.grid_res[2]):
-                        # compute cell center in Python floats
-                        posx = cam.grid_origin[0] + (i + 0.5) * cam.grid_cell_size
-                        posy = cam.grid_origin[1] + (j + 0.5) * cam.grid_cell_size
-                        posz = cam.grid_origin[2] + (k + 0.5) * cam.grid_cell_size
-                        cx = float(center[0])
-                        cy = float(center[1])
-                        cz = float(center[2])
-                        dx = posx - cx
-                        dy = posy - cy
-                        dz = posz - cz
-                        if dx * dx + dy * dy + dz * dz <= influence * influence:
-                            cam.grid_update_weight[i, j, k] = cam.grid_update_weight[i, j, k] * 3.0
+            cam.boost_weights_region([float(center[0]), float(center[1]), float(center[2])], influence, 3.0)
 
         # After boosting, smooth weights to avoid hard seams
         if len(moved_indices) > 0:
@@ -161,12 +147,12 @@ def main():
             # Pure path tracing (no grid updates)
             cam.render(world, mode_int)
         elif render_mode == 'Grid':
-            # Grid-only with fixed 5% update
-            cam.update_grid(world, 0.05)
+            # Grid-only with reduced base update (1%) to improve performance
+            cam.update_grid(world, 0.01)
             cam.render(world, mode_int)
         else:
-            # Adaptive hybrid: we updated weights above, apply base 5% updates
-            cam.update_grid(world, 0.05)
+            # Adaptive hybrid: we updated weights above, apply reduced base update (1%)
+            cam.update_grid(world, 0.01)
             cam.render(world, mode_int)
 
         # Average into display buffer (gamma conversion handled inside)
@@ -240,13 +226,25 @@ def main():
                 ti.tools.imwrite(current_frame, filename)
                 print(f"Saved screenshot: {filename}")
 
-        # Append per-frame data to CSV log
+        # Buffer per-frame data and write in batches to avoid per-frame IO
+        logs_buffer.append([rendered_frames, render_mode, f"{fps:.2f}", f"{mse:.8e}"])
+        if len(logs_buffer) >= 10:
+            try:
+                with open(log_path, 'a', newline='') as f:
+                    w = csv.writer(f)
+                    w.writerows(logs_buffer)
+                logs_buffer.clear()
+            except Exception as e:
+                print(f"Failed to flush logs: {e}")
+
+    # Flush remaining logs on exit
+    if logs_buffer:
         try:
             with open(log_path, 'a', newline='') as f:
                 w = csv.writer(f)
-                w.writerow([rendered_frames, render_mode, f"{fps:.2f}", f"{mse:.8e}"])
+                w.writerows(logs_buffer)
         except Exception as e:
-            print(f"Failed to write log: {e}")
+            print(f"Failed to flush logs on exit: {e}")
 
     # Save last displayed image on exit
     ti.tools.imwrite(current_frame, "output(32x32x32)caizhifenliu.png")

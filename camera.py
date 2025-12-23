@@ -347,6 +347,21 @@ class Camera:
                     self.irradiance_grid[i, j, k] = (1.0 - a) * vec3(1.0, 1.0, 1.0) + a * vec3(0.5, 0.7, 1.0)
 
     @ti.kernel
+    def boost_weights_region(self, cx: vec3, influence: float, multiplier: float):
+        # Boost grid_update_weight for cells within `influence` radius of `cx` by `multiplier`.
+        inf2 = influence * influence
+        for i, j, k in ti.ndrange(self.grid_res[0], self.grid_res[1], self.grid_res[2]):
+            # compute cell center in grid/world space
+            posx = self.grid_origin[0] + (i + 0.5) * self.grid_cell_size
+            posy = self.grid_origin[1] + (j + 0.5) * self.grid_cell_size
+            posz = self.grid_origin[2] + (k + 0.5) * self.grid_cell_size
+            dx = posx - cx[0]
+            dy = posy - cx[1]
+            dz = posz - cx[2]
+            if dx * dx + dy * dy + dz * dz <= inf2:
+                self.grid_update_weight[i, j, k] = self.grid_update_weight[i, j, k] * multiplier
+
+    @ti.kernel
     def blur_update_weights(self):
         # Gaussian blur with 3x3x3 kernel for smoother weight transitions
         # Using approximate Gaussian weights:

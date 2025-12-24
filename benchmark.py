@@ -5,6 +5,7 @@ import os
 import csv
 from datetime import datetime
 from main import main, spheres, cam, world
+import utils
 
 # Note: `main` already initializes Taichi when imported, avoid re-initializing here.
 
@@ -41,7 +42,7 @@ def log_message(message):
 def save_screenshot(gui, filename):
     """Save a screenshot with the given filename"""
     filepath = os.path.join(output_dir, filename)
-    gui.show(filepath)
+    ti.tools.imwrite(current_frame, filepath)
     log_message(f"Saved screenshot: {filepath}")
 
 def calculate_mse(img1, img2):
@@ -90,7 +91,23 @@ def run_benchmark():
     mode_frames = 300  # Number of frames to run per mode
     modes = [RENDER_MODE_PT, RENDER_MODE_GRID, RENDER_MODE_HYBRID]
     current_mode_idx = 0
+    
+    # Initialize grid for Grid and Hybrid modes
+    cam.adapt_grid_to_scene(spheres, verbose=True)
+    log_message("Grid initialized for benchmark")
+    
+    # Initialize current_frame with a small value to avoid pure black
+    current_frame.fill(0.001)
+    
     switch_mode(modes[current_mode_idx])
+    
+    # Do a warm-up render to initialize everything
+    ti.sync()
+    if render_mode == RENDER_MODE_GRID or render_mode == RENDER_MODE_HYBRID:
+        cam.update_grid(world, 0.01)
+    cam.render(world, render_mode)
+    ti.sync()
+    log_message("Warm-up render completed")
     
     # Add timing validation
     last_frame_time = time.perf_counter()
@@ -112,7 +129,17 @@ def run_benchmark():
         
         # Select rendering method based on current mode
         # Use existing render method: mode 0=PT, 1=Grid, 2=Hybrid
-        cam.render(world, render_mode)
+        if render_mode == RENDER_MODE_PT:
+            # Pure path tracing (no grid updates)
+            cam.render(world, render_mode)
+        elif render_mode == RENDER_MODE_GRID:
+            # Grid-only with reduced base update (1%) to improve performance
+            cam.update_grid(world, 0.01)
+            cam.render(world, render_mode)
+        else:
+            # Adaptive hybrid: apply reduced base update (1%)
+            cam.update_grid(world, 0.01)
+            cam.render(world, render_mode)
         
         # Force synchronization after rendering to ensure completion
         ti.sync()
@@ -144,6 +171,12 @@ def run_benchmark():
         # Update frame buffer with progressive rendering
         weight = 1.0 / (current_mode_frames + 1)
         average_frames(current_frame, cam.frame, weight)
+        
+        # Debug: check frame content for first few frames
+        if frame_count < 3:
+            frame_min = float(current_frame.to_numpy().min())
+            frame_max = float(current_frame.to_numpy().max())
+            log_message(f"Frame {frame_count} content: min={frame_min:.6f}, max={frame_max:.6f}")
         
         # Store PT reference for MSE calculation (only at the end of PT mode)
         if render_mode == RENDER_MODE_PT and current_mode_frames == mode_frames - 1:
@@ -215,7 +248,7 @@ def run_benchmark():
 def average_frames(current_frame: ti.template(), new_frame: ti.template(), weight: float):
     """Average frames for progressive rendering"""
     for i, j in new_frame:
-        current_frame[i, j] = (1.0 - weight) * current_frame[i, j] + weight * new_frame[i, j]
+        current_frame[i, j] = (1.0 - weight) * current_frame[i, j] + weight * utils.linear_to_gamma_vec3(new_frame[i, j])
 
 def flush_benchmark_data():
     """Flush any pending benchmark data to CSV immediately"""

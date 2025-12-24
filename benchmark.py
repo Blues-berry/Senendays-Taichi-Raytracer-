@@ -27,7 +27,8 @@ frame_count = 0
 current_mode_frames = 0
 mode_start_time = 0
 benchmark_data = []
-pt_reference = None  # Will store PT reference for MSE calculation
+pt_reference = None  # Will store PT reference for MSE calculation (Linear Space)
+pt_reference_linear = None  # Store linear space version for accurate MSE
 
 # Initialize GUI
 gui = ti.GUI('Raytracing Benchmark', cam.img_res, fast_gui=True)
@@ -45,10 +46,25 @@ def save_screenshot(gui, filename):
     ti.tools.imwrite(current_frame, filepath)
     log_message(f"Saved screenshot: {filepath}")
 
+def calculate_accurate_mse(current_linear, reference_linear):
+    """Calculate MSE in linear space for accurate photometric comparison"""
+    # Ensure both are numpy arrays of type float32
+    curr_f = current_linear.astype(np.float32)
+    ref_f = reference_linear.astype(np.float32)
+    
+    # Normalize to [0, 1] range if needed
+    if curr_f.max() > 1.1:
+        curr_f = curr_f / 255.0
+    if ref_f.max() > 1.1:
+        ref_f = ref_f / 255.0
+    
+    # Calculate MSE in linear space
+    mse = np.mean((curr_f - ref_f) ** 2)
+    return float(mse)
+
 def calculate_mse(img1, img2):
-    """Calculate Mean Squared Error between two images"""
-    diff = img1 - img2
-    return float((diff * diff).mean())
+    """Legacy MSE function - kept for compatibility"""
+    return calculate_accurate_mse(img1, img2)
 
 def save_benchmark_results():
     """Final save of any remaining benchmark data to CSV"""
@@ -86,7 +102,7 @@ def get_mode_name(mode):
     return names.get(mode, "Unknown")
 
 def run_benchmark():
-    global frame_count, current_mode_frames, pt_reference
+    global frame_count, current_mode_frames, pt_reference, pt_reference_linear
     
     mode_frames = 300  # Number of frames to run per mode
     modes = [RENDER_MODE_PT, RENDER_MODE_GRID, RENDER_MODE_HYBRID]
@@ -180,15 +196,17 @@ def run_benchmark():
         
         # Store PT reference for MSE calculation (only at the end of PT mode)
         if render_mode == RENDER_MODE_PT and current_mode_frames == mode_frames - 1:
-            # Store the final PT frame as reference
-            pt_reference = current_frame.to_numpy()
+            # Store both gamma and linear space versions
+            pt_reference = current_frame.to_numpy()  # Gamma space for display compatibility
+            pt_reference_linear = cam.frame.to_numpy()  # Linear space for accurate MSE
             log_message("PT reference frame stored for MSE comparison")
         
         # Calculate MSE if we have a PT reference and we're not in PT mode
         mse = 0.0
-        if pt_reference is not None and render_mode != RENDER_MODE_PT:
-            current_img = current_frame.to_numpy()
-            mse = calculate_mse(pt_reference, current_img)
+        if pt_reference_linear is not None and render_mode != RENDER_MODE_PT:
+            # Use linear space frames for accurate MSE calculation
+            current_linear = cam.frame.to_numpy()  # Current linear frame
+            mse = calculate_accurate_mse(current_linear, pt_reference_linear)
         
         # Update benchmark data
         benchmark_data.append([

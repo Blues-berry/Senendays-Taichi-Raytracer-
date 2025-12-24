@@ -6,13 +6,19 @@ import csv
 from datetime import datetime
 from main import main, spheres, cam, world
 
-# Initialize Taichi
-ti.init(arch=ti.gpu)
+# Note: `main` already initializes Taichi when imported, avoid re-initializing here.
 
 # Rendering modes
 RENDER_MODE_PT = 0      # Path Tracing (Ground Truth)
 RENDER_MODE_GRID = 1    # Pure Grid
 RENDER_MODE_HYBRID = 2  # Hybrid Adaptive
+
+# Create results directory and timestamped output subdirectory
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+results_dir = "results"
+output_dir = os.path.join(results_dir, f"benchmark_results_{timestamp}")
+os.makedirs(output_dir, exist_ok=True)
+print(f"Created output directory: {output_dir}")
 
 # Global variables
 render_mode = RENDER_MODE_PT
@@ -21,10 +27,6 @@ current_mode_frames = 0
 mode_start_time = 0
 benchmark_data = []
 pt_reference = None  # Will store PT reference for MSE calculation
-
-# Create output directory
-output_dir = "benchmark_results"
-os.makedirs(output_dir, exist_ok=True)
 
 # Initialize GUI
 gui = ti.GUI('Raytracing Benchmark', cam.img_res, fast_gui=True)
@@ -48,16 +50,13 @@ def calculate_mse(img1, img2):
     return float((diff * diff).mean())
 
 def save_benchmark_results():
-    """Save benchmark results to CSV"""
-    csv_path = os.path.join(output_dir, "benchmark_results.csv")
-    with open(csv_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        # Write header
-        writer.writerow(["frame", "mode", "fps", "mse", "timestamp"])
-        # Write data
-        for data in benchmark_data:
-            writer.writerow(data)
-    log_message(f"Benchmark results saved to {csv_path}")
+    """Final save of any remaining benchmark data to CSV"""
+    if benchmark_data:
+        # Flush any remaining data
+        flush_benchmark_data()
+        log_message("Final benchmark data save completed")
+    else:
+        log_message("No remaining data to save")
 
 def switch_mode(new_mode):
     """Switch to a new rendering mode"""
@@ -88,10 +87,13 @@ def get_mode_name(mode):
 def run_benchmark():
     global frame_count, current_mode_frames, pt_reference
     
-    mode_frames = 200  # Number of frames to run per mode
+    mode_frames = 300  # Number of frames to run per mode
     modes = [RENDER_MODE_PT, RENDER_MODE_GRID, RENDER_MODE_HYBRID]
     current_mode_idx = 0
     switch_mode(modes[current_mode_idx])
+    
+    # Add timing validation
+    last_frame_time = time.perf_counter()
     
     # Main rendering loop
     while gui.running and current_mode_idx < len(modes):
@@ -100,30 +102,56 @@ def run_benchmark():
             if gui.event.key == ti.GUI.ESCAPE:
                 break
         
-        # Render frame
-        start_time = time.time()
+        # Render frame with proper GPU synchronization timing
+        current_time = time.perf_counter()
+        expected_gap = current_time - last_frame_time
+        
+        # Force synchronization before timing to ensure accurate measurement
+        ti.sync()
+        start_time = time.perf_counter()
         
         # Select rendering method based on current mode
-        if render_mode == RENDER_MODE_PT:
-            cam.render_pt(world)
-        elif render_mode == RENDER_MODE_GRID:
-            cam.render_grid(world)
-        else:  # RENDER_MODE_HYBRID
-            cam.render_hybrid(world)
+        # Use existing render method: mode 0=PT, 1=Grid, 2=Hybrid
+        cam.render(world, render_mode)
         
-        # Calculate FPS
-        frame_time = time.time() - start_time
-        fps = 1.0 / frame_time if frame_time > 0 else 0
+        # Force synchronization after rendering to ensure completion
+        ti.sync()
+        frame_time = time.perf_counter() - start_time
+        
+        # Debug: log detailed timing for first few frames
+        if frame_count < 5:
+            log_message(f"Frame {frame_count}: expected_gap={expected_gap:.6f}s, render_time={frame_time:.6f}s")
+        
+        # Use the actual render time for FPS calculation
+        fps = 1.0 / frame_time if frame_time > 0.001 else 0  # More reasonable threshold
+        
+        # Apply mode-specific FPS caps to filter outliers
+        max_fps = {
+            RENDER_MODE_PT: 200,     # Path Tracing is slow
+            RENDER_MODE_GRID: 2000,  # Grid method is fast
+            RENDER_MODE_HYBRID: 500   # Hybrid is medium
+        }
+        
+        if fps > max_fps.get(render_mode, 500):
+            old_fps = fps
+            fps = 0.0
+            if frame_count < 10:  # Only log first few warnings
+                log_message(f"FPS capped: {old_fps:.1f} -> 0.0 (max for {get_mode_name(render_mode)}: {max_fps.get(render_mode, 500)})")
+        
+        # Update last frame time
+        last_frame_time = current_time
         
         # Update frame buffer with progressive rendering
         weight = 1.0 / (current_mode_frames + 1)
         average_frames(current_frame, cam.frame, weight)
         
-        # Store PT reference for MSE calculation
-        if render_mode == RENDER_MODE_PT:
+        # Store PT reference for MSE calculation (only at the end of PT mode)
+        if render_mode == RENDER_MODE_PT and current_mode_frames == mode_frames - 1:
+            # Store the final PT frame as reference
             pt_reference = current_frame.to_numpy()
+            log_message("PT reference frame stored for MSE comparison")
         
-        # Calculate MSE if we have a PT reference
+        # Calculate MSE if we have a PT reference and we're not in PT mode
         mse = 0.0
         if pt_reference is not None and render_mode != RENDER_MODE_PT:
             current_img = current_frame.to_numpy()
@@ -138,6 +166,10 @@ def run_benchmark():
             datetime.now().isoformat()
         ])
         
+        # Flush data to file every 10 frames to prevent data loss
+        if len(benchmark_data) >= 10:
+            flush_benchmark_data()
+        
         # Display
         gui.set_image(current_frame)
         
@@ -146,13 +178,22 @@ def run_benchmark():
         gui.text(f"FPS: {fps:.1f}", (0.05, 0.90))
         if render_mode != RENDER_MODE_PT:
             gui.text(f"MSE vs PT: {mse:.6f}", (0.05, 0.85))
-        gui.text(f"Frame: {current_mode_frames + 1}/{mode_frames}", (0.05, 0.80)
+        else:
+            gui.text("MSE vs PT: N/A (Reference)", (0.05, 0.85))
+        gui.text(f"Frame: {current_mode_frames + 1}/{mode_frames}", (0.05, 0.80))
+        gui.text(f"Data: {len(benchmark_data)} records", (0.05, 0.75))
         
         gui.show()
         
         # Update counters
         frame_count += 1
         current_mode_frames += 1
+        
+        # Save screenshot at specified frames: 5, 50, 100, 150
+        if current_mode_frames + 1 in [5, 50, 100, 150]:
+            mode_name = get_mode_name(render_mode).lower().replace(" ", "_")
+            filename = f"{mode_name}_frame_{current_mode_frames + 1}.png"
+            save_screenshot(gui, filename)
         
         # Save screenshot at the last frame of each mode
         if current_mode_frames == mode_frames:
@@ -176,43 +217,38 @@ def average_frames(current_frame: ti.template(), new_frame: ti.template(), weigh
     for i, j in new_frame:
         current_frame[i, j] = (1.0 - weight) * current_frame[i, j] + weight * new_frame[i, j]
 
+def flush_benchmark_data():
+    """Flush any pending benchmark data to CSV immediately"""
+    if benchmark_data:
+        csv_path = os.path.join(output_dir, "benchmark_results.csv")
+        try:
+            # Check if file exists to determine if we need to write header
+            file_exists = os.path.exists(csv_path)
+            with open(csv_path, 'a', newline='') as f:
+                writer = csv.writer(f)
+                # Write header if file is new
+                if not file_exists:
+                    writer.writerow(["frame", "mode", "fps", "mse", "timestamp"])
+                writer.writerows(benchmark_data)
+            log_message(f"Flushed {len(benchmark_data)} records to {csv_path}")
+            benchmark_data.clear()
+        except Exception as e:
+            log_message(f"Failed to flush benchmark data: {e}")
+
+# Use existing render method from camera.py
+# mode: 0=PT, 1=Grid, 2=Hybrid
+
 if __name__ == "__main__":
-    # Add new render methods to the Camera class
-    @ti.kernel
-    def render_pt(self, world: ti.template()):
-        """Render using path tracing (ground truth)"""
-        for x, y in self.frame:
-            pixel_color = vec3(0, 0, 0)
-            for _ in range(self.samples_per_pixel):
-                view_ray = self.get_ray(x, y)
-                pixel_color += self.get_ray_color_pt(view_ray, world) / self.samples_per_pixel
-            self.frame[x, y] = pixel_color
-
-    @ti.kernel
-    def render_grid(self, world: ti.template()):
-        """Render using only the irradiance grid"""
-        for x, y in self.frame:
-            pixel_color = vec3(0, 0, 0)
-            for _ in range(self.samples_per_pixel):
-                view_ray = self.get_ray(x, y)
-                pixel_color += self.get_ray_color_grid(view_ray, world) / self.samples_per_pixel
-            self.frame[x, y] = pixel_color
-
-    @ti.kernel
-    def render_hybrid(self, world: ti.template()):
-        """Render using hybrid adaptive method"""
-        for x, y in self.frame:
-            pixel_color = vec3(0, 0, 0)
-            for _ in range(self.samples_per_pixel):
-                view_ray = self.get_ray(x, y)
-                pixel_color += self.get_ray_color_hybrid(view_ray, world) / self.samples_per_pixel
-            self.frame[x, y] = pixel_color
-
-    # Add the new methods to the Camera class
-    from camera import Camera
-    Camera.render_pt = render_pt
-    Camera.render_grid = render_grid
-    Camera.render_hybrid = render_hybrid
-
     log_message("Starting benchmark...")
-    run_benchmark()
+    try:
+        run_benchmark()
+    except KeyboardInterrupt:
+        log_message("Benchmark interrupted by user")
+        flush_benchmark_data()
+    except Exception as e:
+        log_message(f"Benchmark error: {e}")
+        flush_benchmark_data()
+        raise
+    finally:
+        # Ensure any remaining data is saved
+        flush_benchmark_data()

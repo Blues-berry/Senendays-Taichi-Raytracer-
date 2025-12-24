@@ -8,6 +8,7 @@ import random
 import time
 import os
 import csv
+from datetime import datetime
 
 # Initialize Taichi with fixed RNG seed for reproducibility
 ti.init(arch=ti.gpu, random_seed=42)
@@ -75,12 +76,21 @@ for i, s in enumerate(spheres):
 render_mode = 'Adaptive'  # options: 'PT', 'Grid', 'Adaptive'
 mode_map = {'PT': 0, 'Grid': 1, 'Adaptive': 2}
 
-# Ensure experiment log exists and has header
-log_path = 'experiment_log.csv'
-if not os.path.exists(log_path):
-    with open(log_path, 'w', newline='') as f:
-        w = csv.writer(f)
-        w.writerow(['frame_index', 'mode', 'FPS', 'MSE'])
+# Create results directory and timestamped experiment subdirectory
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+results_dir = "results"
+experiment_dir = os.path.join(results_dir, f"experiment_{timestamp}")
+os.makedirs(experiment_dir, exist_ok=True)
+log_path = os.path.join(experiment_dir, 'experiment_log.csv')
+
+# Initialize log file with header
+with open(log_path, 'w', newline='') as f:
+    w = csv.writer(f)
+    w.writerow(['frame_index', 'mode', 'FPS', 'MSE'])
+
+print(f"Created results directory: {results_dir}")
+print(f"Created experiment directory: {experiment_dir}")
+print(f"Experiment log will be saved to: {log_path}")
 
 def main():
     # start_time = time.perf_counter()
@@ -223,8 +233,9 @@ def main():
             rel_frame = rendered_frames - last_move_frame
             if rel_frame == 5 or rel_frame == 50:
                 filename = f"{render_mode}_move_{move_count}_frame_{rel_frame}.png"
-                ti.tools.imwrite(current_frame, filename)
-                print(f"Saved screenshot: {filename}")
+                filepath = os.path.join(experiment_dir, filename)
+                ti.tools.imwrite(current_frame, filepath)
+                print(f"Saved screenshot: {filepath}")
 
         # Buffer per-frame data and write in batches to avoid per-frame IO
         logs_buffer.append([rendered_frames, render_mode, f"{fps:.2f}", f"{mse:.8e}"])
@@ -247,7 +258,10 @@ def main():
             print(f"Failed to flush logs on exit: {e}")
 
     # Save last displayed image on exit
-    ti.tools.imwrite(current_frame, "output(32x32x32)caizhifenliu.png")
+    output_filename = f"output_{render_mode}_{timestamp}.png"
+    output_filepath = os.path.join(experiment_dir, output_filename)
+    ti.tools.imwrite(current_frame, output_filepath)
+    print(f"Saved final output: {output_filepath}")
 
 @ti.kernel
 def average_frames(current_frame: ti.template(), new_frame: ti.template(), weight: float):

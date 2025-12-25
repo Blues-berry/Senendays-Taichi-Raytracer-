@@ -19,64 +19,184 @@ vec3 = ti.types.vector(3, float)
 spheres = []
 materials = []
 
-floor = Sphere(center=vec3(0, -1000, -1), radius=1000)
-floor_mat = material.Lambert(vec3(0.5, 0.5, 0.5))
-spheres.append(floor)
-materials.append(floor_mat)
+# 当前场景模式：'random', 'cornell_box', 'night_scene'
+CURRENT_SCENE = 'random'
 
-# Small spheres grid (deterministic via seeded RNG above)
-for a in range(-11, 11):
-    for b in range(-11, 11):
-        choose_mat = random.random()
-        center = vec3(a + 0.9 * random.random(), 0.2, b + 0.9 * random.random())
-        if (center - vec3(4, 0.2, 0)).norm() > 0.9:
-            if choose_mat < 0.8:
-                # diffuse
-                spheres.append(Sphere(center=center, radius=0.2))
-                materials.append(material.Lambert(utils.rand_vec(0,1) * utils.rand_vec(0,1)))
-            elif choose_mat < 0.95:
-                # metal
-                spheres.append(Sphere(center=center, radius=0.2))
-                materials.append(material.Metal(utils.rand_vec(0.5, 1), 0.5 * random.random()))
-            else:
-                # glass
-                spheres.append(Sphere(center=center, radius=0.2))
-                materials.append(material.Dielectric(1.5))
+def setup_scene(mode: str = 'random'):
+    """根据 mode 构造场景，并返回 (world, cam)。
 
-sph_1 = Sphere(center=vec3(0, 1, 0), radius=1)
-sph_1_mat = material.Dielectric(1.5)
-spheres.append(sph_1)
-materials.append(sph_1_mat)
+    支持：
+    - 'random'：原来的随机小球场景（默认）
+    - 'cornell_box'：五面墙 + 顶部强光 + 金属球/玻璃球
+    - 'night_scene'：黑色背景 + 多彩高亮点光源 + 高反射金属球
+    """
+    global spheres, materials, world, cam, big_indices, prev_centers
 
-sph_2 = Sphere(center=vec3(-4, 1, 0), radius=1)
-sph_2_mat = material.Lambert(vec3(0.4, 0.2, 0.1))
-spheres.append(sph_2)
-materials.append(sph_2_mat)
+    # 重新生成场景时，保持可重复性
+    random.seed(42)
 
-sph_3 = Sphere(center=vec3(4, 1, 0), radius=1)
-sph_3_mat = material.Metal(vec3(0.7, 0.6, 0.5), 0.0)
-spheres.append(sph_3)
-materials.append(sph_3_mat)
+    spheres = []
+    materials = []
 
-# Top light source as primary light
-top_light = Sphere(center=vec3(0, 5, 0), radius=0.5)
-top_light_mat = material.DiffuseLight(vec3(20, 20, 20))
-spheres.append(top_light)
-materials.append(top_light_mat)
+    # 默认相机参数（不同场景会覆盖）
+    cam_params = dict(
+        lookfrom=vec3(13, 2, 3),
+        lookat=vec3(0, 0, 0),
+        vup=vec3(0, 1, 0),
+        vfov=20.0,
+        defocus_angle=0.6,
+        focus_dist=10.0,
+        scene_mode=mode,
+    )
 
-world = World(spheres, materials)
-cam = Camera(world)
-# Adapt grid to scene AABB with verbose output
-print("Initializing irradiance grid...")
-cam.adapt_grid_to_scene(spheres, verbose=True)
+    if mode == 'random':
+        floor = Sphere(center=vec3(0, -1000, -1), radius=1000)
+        floor_mat = material.Lambert(vec3(0.5, 0.5, 0.5))
+        spheres.append(floor)
+        materials.append(floor_mat)
 
-# Identify large spheres (to monitor for movement) and store previous centers
-big_indices = []
-prev_centers = []
-for i, s in enumerate(spheres):
-    if s.radius > 0.9:
-        big_indices.append(i)
-        prev_centers.append(s.center)
+        # Small spheres grid (deterministic via seeded RNG above)
+        for a in range(-11, 11):
+            for b in range(-11, 11):
+                choose_mat = random.random()
+                center = vec3(a + 0.9 * random.random(), 0.2, b + 0.9 * random.random())
+                if (center - vec3(4, 0.2, 0)).norm() > 0.9:
+                    if choose_mat < 0.8:
+                        spheres.append(Sphere(center=center, radius=0.2))
+                        materials.append(material.Lambert(utils.rand_vec(0, 1) * utils.rand_vec(0, 1)))
+                    elif choose_mat < 0.95:
+                        spheres.append(Sphere(center=center, radius=0.2))
+                        materials.append(material.Metal(utils.rand_vec(0.5, 1), 0.5 * random.random()))
+                    else:
+                        spheres.append(Sphere(center=center, radius=0.2))
+                        materials.append(material.Dielectric(1.5))
+
+        sph_1 = Sphere(center=vec3(0, 1, 0), radius=1)
+        spheres.append(sph_1)
+        materials.append(material.Dielectric(1.5))
+
+        sph_2 = Sphere(center=vec3(-4, 1, 0), radius=1)
+        spheres.append(sph_2)
+        materials.append(material.Lambert(vec3(0.4, 0.2, 0.1)))
+
+        sph_3 = Sphere(center=vec3(4, 1, 0), radius=1)
+        spheres.append(sph_3)
+        materials.append(material.Metal(vec3(0.7, 0.6, 0.5), 0.0))
+
+        top_light = Sphere(center=vec3(0, 5, 0), radius=0.5)
+        spheres.append(top_light)
+        materials.append(material.DiffuseLight(vec3(20, 20, 20)))
+
+    elif mode == 'cornell_box':
+        # 用大球模拟 5 面墙（左红、右绿、其余白）
+        white = vec3(0.73, 0.73, 0.73)
+        left_red = vec3(0.65, 0.05, 0.05)
+        right_green = vec3(0.12, 0.45, 0.15)
+
+        # 盒子尺寸（近似）
+        # 通过“中心在±(R+offset)”的大球来近似平面
+        R = 1000.0
+        half = 2.5
+
+        # 左右墙
+        spheres.append(Sphere(center=vec3(-(R + half), 0, 0), radius=R))
+        materials.append(material.Lambert(left_red))
+        spheres.append(Sphere(center=vec3((R + half), 0, 0), radius=R))
+        materials.append(material.Lambert(right_green))
+
+        # 地面 / 天花板 / 后墙（白）
+        spheres.append(Sphere(center=vec3(0, -(R + half), 0), radius=R))
+        materials.append(material.Lambert(white))
+        spheres.append(Sphere(center=vec3(0, (R + half), 0), radius=R))
+        materials.append(material.Lambert(white))
+        spheres.append(Sphere(center=vec3(0, 0, -(R + half)), radius=R))
+        materials.append(material.Lambert(white))
+
+        # 顶部强发光球
+        spheres.append(Sphere(center=vec3(0, half - 0.2, -1.0), radius=0.35))
+        materials.append(material.DiffuseLight(vec3(15, 15, 15)))
+
+        # 盒内：金属球 + 玻璃球
+        spheres.append(Sphere(center=vec3(-0.8, -half + 0.6, -1.2), radius=0.6))
+        materials.append(material.Metal(vec3(0.85, 0.85, 0.85), 0.02))
+
+        spheres.append(Sphere(center=vec3(0.9, -half + 0.6, -0.6), radius=0.6))
+        materials.append(material.Dielectric(1.5))
+
+        # Cornell Box 相机建议：在盒子外面往里看
+        cam_params.update(
+            lookfrom=vec3(0, 0, 8),
+            lookat=vec3(0, -0.5, -1.0),
+            vfov=40.0,
+            defocus_angle=0.0,
+            focus_dist=8.0,
+        )
+
+    elif mode == 'night_scene':
+        # 暗色地面
+        spheres.append(Sphere(center=vec3(0, -1000, 0), radius=1000))
+        materials.append(material.Lambert(vec3(0.08, 0.08, 0.09)))
+
+        # 5 个不同颜色的高亮度点光源
+        light_positions = [
+            vec3(-6, 4, -2),
+            vec3(-2, 3, 2),
+            vec3(2, 3.5, -1),
+            vec3(6, 4, 2),
+            vec3(0, 5, 6),
+        ]
+        light_colors = [
+            vec3(15, 9, 4),   # 暖橘
+            vec3(4, 10, 15),  # 冰蓝
+            vec3(14, 4, 10),  # 洋红
+            vec3(6, 15, 6),   # 绿
+            vec3(12, 12, 16), # 冷白偏蓝
+        ]
+        for p, c in zip(light_positions, light_colors):
+            spheres.append(Sphere(center=p, radius=0.35))
+            materials.append(material.DiffuseLight(c))
+
+        # 随机散布高反射金属球
+        for _ in range(25):
+            x = random.uniform(-7.0, 7.0)
+            z = random.uniform(-7.0, 7.0)
+            r = random.uniform(0.25, 0.6)
+            y = r
+            spheres.append(Sphere(center=vec3(x, y, z), radius=r))
+            # 高反射：低 fuzz
+            base = utils.rand_vec(0.7, 1.0)
+            materials.append(material.Metal(base, random.uniform(0.0, 0.08)))
+
+        cam_params.update(
+            lookfrom=vec3(0, 3, 12),
+            lookat=vec3(0, 1, 0),
+            vfov=35.0,
+            defocus_angle=0.0,
+            focus_dist=12.0,
+        )
+
+    else:
+        raise ValueError(f"未知场景模式: {mode}")
+
+    world = World(spheres, materials)
+    cam = Camera(world, **cam_params)
+
+    print(f"Initializing scene: {mode}")
+    cam.adapt_grid_to_scene(spheres, verbose=True)
+
+    # Identify large spheres (to monitor for movement) and store previous centers
+    big_indices = []
+    prev_centers = []
+    for i, s in enumerate(spheres):
+        if s.radius > 0.9:
+            big_indices.append(i)
+            prev_centers.append(s.center)
+
+    return world, cam
+
+
+# 初始化场景
+world, cam = setup_scene(CURRENT_SCENE)
 
 # Experiment control
 render_mode = 'Adaptive'  # options: 'PT', 'Grid', 'Adaptive'

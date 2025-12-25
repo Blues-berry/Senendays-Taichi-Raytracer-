@@ -10,7 +10,31 @@ ray_return = ti.types.struct(hit_surface=bool, resulting_ray=Ray, color=vec3)
 
 @ti.data_oriented
 class Camera:
-    def __init__(self, world: ti.template()):
+    @ti.func
+    def get_background_color(self, direction: vec3) -> vec3:
+        """根据场景模式返回背景色"""
+        if ti.static(self.scene_mode in ['night_scene', 'cornell_box']):
+            # 夜间场景和Cornell Box使用纯黑背景
+            return vec3(0.0, 0.0, 0.0)
+        else:
+            # 默认的渐变天空色
+            unit_direction = direction.normalized()
+            a = 0.5 * (unit_direction[1] + 1.0)
+            return (1.0 - a) * vec3(1.0, 1.0, 1.0) + a * vec3(0.5, 0.7, 1.0)
+
+    def __init__(
+        self,
+        world: ti.template(),
+        lookfrom=vec3(13, 2, 3),
+        lookat=vec3(0, 0, 0),
+        vup=vec3(0, 1, 0),
+        vfov=20.0,
+        defocus_angle=0.6,
+        focus_dist=10.0,
+        scene_mode: str = 'random',
+    ):
+        # 记录当前场景模式（用于背景色等逻辑）
+        self.scene_mode = scene_mode
         aspect_ratio = 16.0 / 9.0
         width = 1200
         height = int(width / aspect_ratio)
@@ -19,12 +43,11 @@ class Camera:
         self.samples_per_pixel = 5
         self.max_ray_depth = 500
 
-        vfov = 20
-        lookfrom = vec3(13,2,3)
-        lookat = vec3(0,0,0)
-        vup = vec3(0,1,0)
-        self.defocus_angle = 0.6
-        focus_dist = 10
+        # Use parameters passed into constructor (do not overwrite)
+        # `vfov`, `lookfrom`, `lookat`, `vup`, `defocus_angle`, `focus_dist`
+        # are provided by the caller (e.g. `setup_scene`) and should not
+        # be replaced by hard-coded defaults here.
+        self.defocus_angle = defocus_angle
 
         # Virtual rectangle in scene that camera sends rays through
         theta = math.radians(vfov)
@@ -188,9 +211,7 @@ class Camera:
                     break
             else:
                 # 抵达背景
-                unit_direction = current_ray.direction.normalized()
-                a = 0.5 * (unit_direction[1] + 1.0)
-                env = (1.0 - a) * vec3(1.0, 1.0, 1.0) + a * vec3(0.5, 0.7, 1.0)
+                env = self.get_background_color(current_ray.direction)
                 color = attenuation * env
                 break
         return color
@@ -210,9 +231,7 @@ class Camera:
                 # Sample irradiance grid for non-light sources
                 color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id)
         else:
-            unit_direction = ray.direction.normalized()
-            a = 0.5 * (unit_direction[1] + 1.0)
-            color = (1.0 - a) * vec3(1.0, 1.0, 1.0) + a * vec3(0.5, 0.7, 1.0)
+            color = self.get_background_color(ray.direction)
         return color
 
     # === 混合模式（自适应） ===
@@ -257,9 +276,7 @@ class Camera:
                                     break
                             else:
                                 # Ray escaped to background
-                                unit_direction = current_ray.direction.normalized()
-                                a = 0.5 * (unit_direction[1] + 1.0)
-                                background = (1.0 - a) * vec3(1.0, 1.0, 1.0) + a * vec3(0.5, 0.7, 1.0)
+                                background = self.get_background_color(current_ray.direction)
                                 bounced_color = attenuation * background
                                 break
                         else:
@@ -272,9 +289,7 @@ class Camera:
                     color = bounced_color + grid_color * ambient_contribution
         else:
             # Background color
-            unit_direction = ray.direction.normalized()
-            a = 0.5 * (unit_direction[1] + 1.0)
-            color = (1.0 - a) * vec3(1.0, 1.0, 1.0) + a * vec3(0.5, 0.7, 1.0)
+            color = self.get_background_color(ray.direction)
 
         return color
 
@@ -312,9 +327,7 @@ class Camera:
                 color = vec3(0, 0, 0)
         else:
             # Background color
-            unit_direction = ray.direction.normalized()
-            a = 0.5 * (unit_direction[1] + 1.0)
-            color = (1.0 - a) * vec3(1.0, 1.0, 1.0) + a * vec3(0.5, 0.7, 1.0)
+            color = self.get_background_color(ray.direction)
         return ray_return(hit_surface=hit.did_hit, resulting_ray=resulting_ray, color=color)
 
     @ti.kernel
@@ -347,7 +360,7 @@ class Camera:
                             # second ray missed -> use environment color attenuated
                             unit_direction = r2.direction.normalized()
                             a = 0.5 * (unit_direction[1] + 1.0)
-                            env = (1.0 - a) * vec3(1.0, 1.0, 1.0) + a * vec3(0.5, 0.7, 1.0)
+                            env = self.get_background_color(r2.direction)
                             col = scatter_ret.attenuation * env
                     else:
                         # no scatter: use albedo (local) only

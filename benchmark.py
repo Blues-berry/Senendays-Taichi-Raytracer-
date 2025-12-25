@@ -4,7 +4,8 @@ import time
 import os
 import csv
 from datetime import datetime
-from main import main, spheres, cam, world
+import main
+from main import spheres, cam, world
 import utils
 
 # Note: `main` already initializes Taichi when imported, avoid re-initializing here.
@@ -101,8 +102,14 @@ def get_mode_name(mode):
     }
     return names.get(mode, "Unknown")
 
-def run_benchmark():
-    global frame_count, current_mode_frames, pt_reference, pt_reference_linear
+def run_benchmark(scene_mode='cornell_box'):
+    global frame_count, current_mode_frames, pt_reference, pt_reference_linear, world, cam, spheres, materials
+
+    # 使用指定场景模式初始化场景
+    world, cam = main.setup_scene(scene_mode)
+
+    # 设置场景模式到相机对象
+    cam.scene_mode = scene_mode
     
     mode_frames = 450  # Number of frames to run per mode
     modes = [RENDER_MODE_PT, RENDER_MODE_GRID, RENDER_MODE_HYBRID]
@@ -112,9 +119,9 @@ def run_benchmark():
     displacement_occurred = False
     displacement_frame_in_mode = -1  # Track frames after displacement
     
-    # Initialize grid for Grid and Hybrid modes
+    # Grid 初始化（setup_scene 内已经 adapt 过，这里保持一次以防后续逻辑依赖）
     cam.adapt_grid_to_scene(spheres, verbose=True)
-    log_message("Grid initialized for benchmark")
+    log_message(f"Grid initialized for benchmark (scene={scene_mode})")
     
     # Initialize current_frame with a small value to avoid pure black
     current_frame.fill(0.001)

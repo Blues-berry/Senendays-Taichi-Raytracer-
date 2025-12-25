@@ -78,42 +78,40 @@ def plot_mse_over_time(rows, out_dir: str, title: str = "MSE over time (log scal
     print(f"Saved: {png_path}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Plot benchmark MSE curves from CSV")
-    parser.add_argument(
-        "--csv",
-        type=str,
-        default=None,
-        help="Path to benchmark_results.csv (default: latest in ./results)",
-    )
-    parser.add_argument(
-        "--out",
-        type=str,
-        default=None,
-        help="Output directory for plots (default: <csv_dir>/plots)",
-    )
-    args = parser.parse_args()
+def read_benchmark_data(results_dir: str):
+    """Read benchmark_results.csv from a results directory and group by mode.
 
-    if args.csv is None:
-        latest_dir = find_latest_results_dir("results")
-        if latest_dir is None:
-            raise SystemExit("No results found under ./results")
-        csv_path = os.path.join(latest_dir, "benchmark_results.csv")
-    else:
-        csv_path = args.csv
+    Returns a dict:
+        {mode: {'frame': [...], 'fps': [...], 'mse': [...], 'timestamp': [...]}}
+    """
+    csv_path = os.path.join(results_dir, "benchmark_results.csv")
+    try:
+        rows = read_benchmark_csv(csv_path)
+    except FileNotFoundError:
+        print(f"benchmark_results.csv not found: {csv_path}")
+        return None
 
-    rows = read_benchmark_csv(csv_path)
+    data = {}
+    for r in rows:
+        mode = r["mode"]
+        if mode not in data:
+            data[mode] = {"frame": [], "fps": [], "mse": [], "timestamp": []}
+        data[mode]["frame"].append(r["frame"])
+        data[mode]["fps"].append(r["fps"])
+        data[mode]["mse"].append(r["mse"])
+        data[mode]["timestamp"].append(r.get("timestamp", ""))
 
-    if args.out is None:
-        out_dir = os.path.join(os.path.dirname(csv_path), "plots")
-    else:
-        out_dir = args.out
+    # Ensure sorted by frame within each mode
+    for mode, values in data.items():
+        if values["frame"]:
+            order = np.argsort(np.array(values["frame"], dtype=np.int64))
+            for k in ("frame", "fps", "mse", "timestamp"):
+                values[k] = [values[k][i] for i in order]
 
-    plot_mse_over_time(rows, out_dir)
+    return data
 
 
-if __name__ == "__main__":
-    main()
+# NOTE: main() is defined later in this file (below) as the richer CLI/plotter.
 
 def plot_detailed_mse_analysis(data, output_dir):
     """Create detailed MSE analysis plots"""
@@ -255,34 +253,54 @@ def generate_summary_report(data, output_dir):
     
     print(f"Summary report saved to: {report_path}")
 
+def plot_mse_comparison(data, output_dir: str):
+    """Compatibility wrapper around plot_mse_over_time."""
+    rows = []
+    for mode, values in data.items():
+        for i, frame in enumerate(values.get("frame", [])):
+            rows.append(
+                {
+                    "frame": int(frame),
+                    "mode": mode,
+                    "fps": float(values["fps"][i]) if i < len(values.get("fps", [])) else 0.0,
+                    "mse": float(values["mse"][i]) if i < len(values.get("mse", [])) else 0.0,
+                    "timestamp": values.get("timestamp", [""])[i]
+                    if i < len(values.get("timestamp", []))
+                    else "",
+                }
+            )
+
+    plot_mse_over_time(rows, output_dir, title="MSE over time (log scale)")
+
+
 def main():
     """Main function to plot benchmark results"""
     print("=== Raytracing Benchmark Results Plotter ===")
-    
+
     # Find the latest results directory
     results_dir = find_latest_results_dir()
     if not results_dir:
         return
-    
+
     # Read benchmark data
     data = read_benchmark_data(results_dir)
     if not data:
         return
-    
+
     # Create plots directory
     plots_dir = os.path.join(results_dir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
-    
+
     # Generate plots
     print("\nGenerating MSE comparison plot...")
     plot_mse_comparison(data, plots_dir)
-    
+
     print("\nGenerating detailed MSE analysis...")
     plot_detailed_mse_analysis(data, plots_dir)
-    
+
     print("\nGenerating summary report...")
     generate_summary_report(data, plots_dir)
-    
+
     print(f"\nAll plots and reports saved to: {plots_dir}")
     print("Plot generation completed successfully!")
 

@@ -110,6 +110,7 @@ def run_benchmark():
     
     # Track if displacement has occurred in current mode
     displacement_occurred = False
+    displacement_frame_in_mode = -1  # Track frames after displacement
     
     # Initialize grid for Grid and Hybrid modes
     cam.adapt_grid_to_scene(spheres, verbose=True)
@@ -250,6 +251,7 @@ def run_benchmark():
 
             # Mark displacement as occurred
             displacement_occurred = True
+            displacement_frame_in_mode = 0  # we'll count frames after displacement from 0
 
             # Reset frame buffer and frame counter for ALL modes.
             # This is critical to observe MSE spike at the displacement moment and subsequent convergence.
@@ -265,9 +267,18 @@ def run_benchmark():
             # Force sync so the movement + reset are visible immediately
             ti.sync()
 
+        # Screenshot: the 10th frame AFTER displacement (only once per mode)
+        if displacement_occurred and displacement_frame_in_mode == 10:
+            mode_name = get_mode_name(render_mode).lower().replace(" ", "_")
+            save_screenshot(gui, f"after_displacement_{mode_name}_frame_10.png")
+            # Prevent repeated saves if counters get reset unexpectedly
+            displacement_frame_in_mode = -999999
+
         # Update counters
         frame_count += 1
         current_mode_frames += 1
+        if displacement_occurred and displacement_frame_in_mode >= 0:
+            displacement_frame_in_mode += 1
         
         # Save screenshot at specified frames: 5, 50, 100 (before displacement), then after displacement: 200, 250, 300, 350, 400, 450
         screenshot_frames = [5, 50, 100, 200, 250, 300, 350, 400, 450]
@@ -289,6 +300,7 @@ def run_benchmark():
                 switch_mode(modes[current_mode_idx])
                 # Reset displacement flag for new mode
                 displacement_occurred = False
+                displacement_frame_in_mode = -1
             else:
                 # Benchmark complete
                 save_benchmark_results()

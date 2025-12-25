@@ -247,21 +247,23 @@ def run_benchmark():
             old_pos = spheres[light_index].center[0]
             spheres[light_index].center[0] = old_pos + 1.0
             log_message(f"Light source displaced from X={old_pos:.1f} to X={spheres[light_index].center[0]:.1f}")
-            
+
             # Mark displacement as occurred
             displacement_occurred = True
-            
-            # For PT mode: just log displacement and continue (no reset)
-            if render_mode == RENDER_MODE_PT:
-                log_message("PT mode: displacement triggered, continuing to observe dynamic convergence")
-            else:
-                # For Grid and Hybrid modes: reset frame buffer for dynamic convergence observation
-                current_frame.fill(0)
-                log_message("Frame buffer reset for dynamic convergence observation")
-                
-                # Re-adapt grid for Grid and Hybrid modes
-                if render_mode == RENDER_MODE_GRID or render_mode == RENDER_MODE_HYBRID:
-                    cam.adapt_grid_to_scene(spheres, verbose=False)
+
+            # Reset frame buffer and frame counter for ALL modes.
+            # This is critical to observe MSE spike at the displacement moment and subsequent convergence.
+            current_frame.fill(0)
+            current_mode_frames = 0
+            log_message(f"Frame buffer and counter reset for {get_mode_name(render_mode)} mode after displacement")
+
+            # Re-adapt grid for Grid and Hybrid modes
+            if render_mode == RENDER_MODE_GRID or render_mode == RENDER_MODE_HYBRID:
+                cam.adapt_grid_to_scene(spheres, verbose=False)
+                log_message("Grid re-adapted after light source movement")
+
+            # Force sync so the movement + reset are visible immediately
+            ti.sync()
 
         # Update counters
         frame_count += 1

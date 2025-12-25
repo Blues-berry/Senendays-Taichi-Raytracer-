@@ -58,6 +58,12 @@ sph_3_mat = material.Metal(vec3(0.7, 0.6, 0.5), 0.0)
 spheres.append(sph_3)
 materials.append(sph_3_mat)
 
+# Top light source as primary light
+top_light = Sphere(center=vec3(0, 5, 0), radius=0.5)
+top_light_mat = material.DiffuseLight(vec3(20, 20, 20))
+spheres.append(top_light)
+materials.append(top_light_mat)
+
 world = World(spheres, materials)
 cam = Camera(world)
 # Adapt grid to scene AABB with verbose output

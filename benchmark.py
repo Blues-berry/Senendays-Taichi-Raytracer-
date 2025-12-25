@@ -104,9 +104,12 @@ def get_mode_name(mode):
 def run_benchmark():
     global frame_count, current_mode_frames, pt_reference, pt_reference_linear
     
-    mode_frames = 300  # Number of frames to run per mode
+    mode_frames = 450  # Number of frames to run per mode
     modes = [RENDER_MODE_PT, RENDER_MODE_GRID, RENDER_MODE_HYBRID]
     current_mode_idx = 0
+    
+    # Track if displacement has occurred in current mode
+    displacement_occurred = False
     
     # Initialize grid for Grid and Hybrid modes
     cam.adapt_grid_to_scene(spheres, verbose=True)
@@ -194,8 +197,8 @@ def run_benchmark():
             frame_max = float(current_frame.to_numpy().max())
             log_message(f"Frame {frame_count} content: min={frame_min:.6f}, max={frame_max:.6f}")
         
-        # Store PT reference for MSE calculation (only at the end of PT mode)
-        if render_mode == RENDER_MODE_PT and current_mode_frames == mode_frames - 1:
+        # Store PT reference for MSE calculation (at frame 149, before displacement at frame 150)
+        if render_mode == RENDER_MODE_PT and current_mode_frames == 149:
             # Store both gamma and linear space versions
             pt_reference = current_frame.to_numpy()  # Gamma space for display compatibility
             pt_reference_linear = cam.frame.to_numpy()  # Linear space for accurate MSE
@@ -236,18 +239,44 @@ def run_benchmark():
         
         gui.show()
         
+        # Dynamic displacement trigger: at frame 150, move the light source (only once per mode)
+        if current_mode_frames == 150 and not displacement_occurred and len(spheres) > 0:
+            log_message(f"DISPLACEMENT TRIGGERED - Total frames: {frame_count}, Mode frames: {current_mode_frames}")
+            # Find the light source (the last sphere added, with high albedo)
+            light_index = len(spheres) - 1  # The top light we added
+            old_pos = spheres[light_index].center[0]
+            spheres[light_index].center[0] = old_pos + 1.0
+            log_message(f"Light source displaced from X={old_pos:.1f} to X={spheres[light_index].center[0]:.1f}")
+            
+            # Mark displacement as occurred
+            displacement_occurred = True
+            
+            # For PT mode: just log displacement and continue (no reset)
+            if render_mode == RENDER_MODE_PT:
+                log_message("PT mode: displacement triggered, continuing to observe dynamic convergence")
+            else:
+                # For Grid and Hybrid modes: reset frame buffer for dynamic convergence observation
+                current_frame.fill(0)
+                log_message("Frame buffer reset for dynamic convergence observation")
+                
+                # Re-adapt grid for Grid and Hybrid modes
+                if render_mode == RENDER_MODE_GRID or render_mode == RENDER_MODE_HYBRID:
+                    cam.adapt_grid_to_scene(spheres, verbose=False)
+
         # Update counters
         frame_count += 1
         current_mode_frames += 1
         
-        # Save screenshot at specified frames: 5, 50, 100, 150
-        if current_mode_frames + 1 in [5, 50, 100, 150]:
+        # Save screenshot at specified frames: 5, 50, 100 (before displacement), then after displacement: 200, 250, 300, 350, 400, 450
+        screenshot_frames = [5, 50, 100, 200, 250, 300, 350, 400, 450]
+        if current_mode_frames in screenshot_frames:
             mode_name = get_mode_name(render_mode).lower().replace(" ", "_")
-            filename = f"{mode_name}_frame_{current_mode_frames + 1}.png"
+            filename = f"{mode_name}_frame_{current_mode_frames}.png"
             save_screenshot(gui, filename)
         
         # Save screenshot at the last frame of each mode
         if current_mode_frames == mode_frames:
+            log_message(f"MODE COMPLETE - Total frames: {frame_count}, Mode frames: {current_mode_frames}")
             # Save screenshot
             mode_name = get_mode_name(render_mode).lower().replace(" ", "_")
             save_screenshot(gui, f"result_{mode_name}.png")
@@ -256,6 +285,8 @@ def run_benchmark():
             current_mode_idx += 1
             if current_mode_idx < len(modes):
                 switch_mode(modes[current_mode_idx])
+                # Reset displacement flag for new mode
+                displacement_occurred = False
             else:
                 # Benchmark complete
                 save_benchmark_results()

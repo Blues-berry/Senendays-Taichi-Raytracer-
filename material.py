@@ -61,6 +61,7 @@ class Materials:
     LAMBERT = 0
     METAL = 1
     DIELECTRIC = 2
+    DIFFUSE_LIGHT = 3
 
     def __init__(self, n: int):
         self.roughness = ti.field(ti.f32)
@@ -85,6 +86,8 @@ class Materials:
             scatter_ret = Metal.scatter(ray, record, self.albedo[record.id], self.roughness[record.id])
         if mat_idx == Materials.DIELECTRIC:
             scatter_ret = Dielectric.scatter(ray, record, self.albedo[record.id], self.ior[record.id])
+        if mat_idx == Materials.DIFFUSE_LIGHT:
+            scatter_ret = DiffuseLight.scatter(ray, record, self.albedo[record.id])
         return scatter_ret
 
 
@@ -146,3 +149,17 @@ class Dielectric:
 
         scattered = Ray(record.p, direction)
         return scatter_return(did_scatter=True, attenuation=attenuation, scattered=scattered)
+
+class DiffuseLight:
+    def __init__(self, emit: vec3):
+        self.albedo = emit  # Store emission in albedo field for consistency
+        self.emit = emit
+        self.index = Materials.DIFFUSE_LIGHT
+        self.roughness = 0.0
+        self.ior = 1.0
+    
+    @staticmethod
+    @ti.func
+    def scatter(ray: Ray, record: hit_record, emit: vec3) -> scatter_return:
+        # Light sources don't scatter, they just emit
+        return scatter_return(did_scatter=False, attenuation=emit, scattered=ray)

@@ -183,7 +183,8 @@ class Camera:
                     current_ray = Ray(origin=scatter_ret.scattered.origin + tm.normalize(scatter_ret.scattered.direction) * 0.0002,
                                       direction=scatter_ret.scattered.direction)
                 else:
-                    # 吸收
+                    # 发光材质或不散射材质，返回发光颜色
+                    color = attenuation * scatter_ret.attenuation
                     break
             else:
                 # 抵达背景
@@ -200,7 +201,14 @@ class Camera:
         hit = world.hit_world(ray, 0.001, tm.inf)
         color = vec3(0.0)
         if hit.did_hit:
-            color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id)
+            # Check if this is a light source
+            mat_idx = world.materials.mat_index[hit.record.id]
+            if mat_idx == world.materials.DIFFUSE_LIGHT:
+                # Direct light emission
+                color = world.materials.albedo[hit.record.id]
+            else:
+                # Sample irradiance grid for non-light sources
+                color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id)
         else:
             unit_direction = ray.direction.normalized()
             a = 0.5 * (unit_direction[1] + 1.0)
@@ -216,47 +224,52 @@ class Camera:
         if hit.did_hit:
             mat_idx = world.materials.mat_index[hit.record.id]
 
-            # Sample grid for ambient term or primary color
-            grid_color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id)
+            # Handle light sources directly
+            if mat_idx == world.materials.DIFFUSE_LIGHT:
+                # Direct light emission
+                color = world.materials.albedo[hit.record.id]
+            else:
+                # Sample grid for ambient term or primary color
+                grid_color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id)
 
-            if mat_idx == world.materials.LAMBERT:
-                # For Lambertian, the color is primarily from the grid
-                color = grid_color
-            else:  # Metal or Dielectric
-                # For specular materials, trace further and add ambient term
-                bounced_color = vec3(0.0)
-                attenuation = vec3(1.0)
-                current_ray = ray
-                current_hit_record = hit.record
+                if mat_idx == world.materials.LAMBERT:
+                    # For Lambertian, the color is primarily from the grid
+                    color = grid_color
+                else:  # Metal or Dielectric
+                    # For specular materials, trace further and add ambient term
+                    bounced_color = vec3(0.0)
+                    attenuation = vec3(1.0)
+                    current_ray = ray
+                    current_hit_record = hit.record
 
-                # Perform 1-2 bounces for reflections
-                for i in range(2):
-                    scatter_ret = world.materials.scatter(current_ray, current_hit_record)
-                    if scatter_ret.did_scatter:
-                        attenuation *= scatter_ret.attenuation
-                        current_ray = scatter_ret.scattered
-                        bounce_hit = world.hit_world(current_ray, 0.001, tm.inf)
-                        if bounce_hit.did_hit:
-                            current_hit_record = bounce_hit.record
-                            # If the bounce hits a diffuse surface, sample grid and terminate
-                            if world.materials.mat_index[bounce_hit.record.id] == world.materials.LAMBERT:
-                                bounced_color = attenuation * self.sample_irradiance_grid(bounce_hit.record.p, world, bounce_hit.record.id)
+                    # Perform 1-2 bounces for reflections
+                    for i in range(2):
+                        scatter_ret = world.materials.scatter(current_ray, current_hit_record)
+                        if scatter_ret.did_scatter:
+                            attenuation *= scatter_ret.attenuation
+                            current_ray = scatter_ret.scattered
+                            bounce_hit = world.hit_world(current_ray, 0.001, tm.inf)
+                            if bounce_hit.did_hit:
+                                current_hit_record = bounce_hit.record
+                                # If the bounce hits a diffuse surface, sample grid and terminate
+                                if world.materials.mat_index[bounce_hit.record.id] == world.materials.LAMBERT:
+                                    bounced_color = attenuation * self.sample_irradiance_grid(bounce_hit.record.p, world, bounce_hit.record.id)
+                                    break
+                            else:
+                                # Ray escaped to background
+                                unit_direction = current_ray.direction.normalized()
+                                a = 0.5 * (unit_direction[1] + 1.0)
+                                background = (1.0 - a) * vec3(1.0, 1.0, 1.0) + a * vec3(0.5, 0.7, 1.0)
+                                bounced_color = attenuation * background
                                 break
                         else:
-                            # Ray escaped to background
-                            unit_direction = current_ray.direction.normalized()
-                            a = 0.5 * (unit_direction[1] + 1.0)
-                            background = (1.0 - a) * vec3(1.0, 1.0, 1.0) + a * vec3(0.5, 0.7, 1.0)
-                            bounced_color = attenuation * background
+                            # Absorbed
+                            bounced_color = vec3(0.0)
                             break
-                    else:
-                        # Absorbed
-                        bounced_color = vec3(0.0)
-                        break
 
-                # Final color is the traced reflection plus a small ambient contribution from the grid
-                ambient_contribution = 0.15
-                color = bounced_color + grid_color * ambient_contribution
+                    # Final color is the traced reflection plus a small ambient contribution from the grid
+                    ambient_contribution = 0.15
+                    color = bounced_color + grid_color * ambient_contribution
         else:
             # Background color
             unit_direction = ray.direction.normalized()

@@ -291,11 +291,18 @@ def main():
             # Adaptive hybrid: we updated weights above, apply reduced base update (1%)
             cam.update_grid(world, 0.01)
             cam.render(world, mode_int)
+            # Apply lightweight A-SVGF to hybrid frame to reduce noise while preserving edges
+            cam.asvgf_filter()
 
         # Average into display buffer (gamma conversion handled inside)
         average_frames(current_frame, cam.frame, weight)
         gui.set_image(current_frame)
         gui.show()
+
+        # Update adaptive sampling weights (computed from current frame) for next frame
+        cam.compute_adaptive_weights(cfg.ADAPTIVE_BRIGHTNESS_THRESHOLD,
+                         cfg.ADAPTIVE_SAMPLING_MULTIPLIER,
+                         cfg.ADAPTIVE_MAX_MULTIPLIER)
 
         # --- Experiment automation bookkeeping ---
         rendered_frames += 1

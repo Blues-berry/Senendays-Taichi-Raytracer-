@@ -1,2 +1,15 @@
-分析你提到的 Hybrid 渲染效果像“贴图”、不真实以及亮度异常的问题，主要原因出在辐照度场（Irradiance Grid）的更新逻辑、插值方式以及颜色空间管理上。以下是详细的深度分析和改进建议：1. 为什么 Hybrid 模式会显得“像贴图”且“不真实”？这种“贴图感”通常是因为光影失去了高频细节（High-frequency details）和正确的几何遮蔽（Ambient Occlusion）。网格分辨率过低：在 experiment_config.py 中，你的网格分辨率通常设为 $16 \times 16 \times 16$。这意味着在巨大的场景空间中，每两个采样点之间的距离很大。当你插值获取颜色时，光影会变得极其平滑，失去了阴影边界。缺乏次级反射的细节：Hybrid 模式本质上是用预计算/缓存的网格颜色代替了实时的 Path Tracing。如果网格采样时没有考虑足够的 Ray Depth，或者更新频率不足，网格里的数据就只是过时的“平均色”。漏光（Light Leaking）：这是网格算法的通病。如果一个网格点在墙外，一个在墙内，插值时墙内会引入墙外的亮度，导致物体看起来像是在发光或悬浮，失去了接地感（Grounding）。2. 为什么比 Path Tracing 亮很多？这是一个非常关键的技术错误，通常由以下两个原因引起：A. 颜色空间双重补偿（Gamma Correction Error）在 benchmark.py 的 average_frames 中，你有一行代码：Pythoncurrent_frame[i, j] = (1.0 - weight) * current_frame[i, j] + weight * utils.linear_to_gamma_vec3(new_frame[i, j])
-如果 new_frame（Grid 模式生成的）已经是经过 Gamma 处理的，或者你在网格中存储的是 Gamma 空间的值，再次调用 linear_to_gamma 会导致亮度指数级增加，使画面泛白。解决建议：统一在 Linear Space 进行所有计算和网格存储，只在最后一刻（输出到 GUI 前）进行 Gamma 校正。B. 能量守恒与权重累加如果 Grid 更新时，权重 $w$ 的计算没有严格归一化，或者在 Hybrid 混合时 (1 - alpha) * PT + alpha * Grid 的 alpha 逻辑有偏置，会导致能量不守恒。3. 如何达到路径追踪（Path Tracing）的质感？要让 Hybrid 逼近 PT 的质感，你需要引入间接光照缓存而非直接颜色替换。方案一：只对间接光（Indirect Light）使用网格目前的 Hybrid 可能是直接拿网格颜色当最终像素色。改进：直接光（Direct Illumination）：每一帧依然用简单的 Ray Cast 计算（产生硬阴影和高光）。间接光（Indirect）：从网格中读取。合成：$Final = Direct + Indirect$。这样能保证物体边缘和阴影的锐利度。方案二：引入三线性插值与法线权重（Normal Weighting）目前的插值可能没考虑法线。如果像素点的法线向上，它应该更多地参考上方网格点的数据。改进：在从网格读取数据时，判断当前表面法线 $N$ 与网格点方向的夹角，避免墙背面的光照污染墙正面。方案三：增加网格更新的“质量”在 camera.py 更新网格点时：增加采样数：不仅仅用 samples_per_pixel，给网格点更新分配更高的 Ray Depth。引入指数平滑：使用 $Grid = (1-\alpha)Grid_{old} + \alpha Grid_{new}$，但 $\alpha$ 应该根据场景是否变化动态调整。建议检查清单检查 utils.py 中的 Gamma 函数：确保没有对同一个像素连续执行两次 linear_to_gamma。提升网格密度：尝试将 GRID_RESOLUTION 提高到 $(32, 32, 32)$，观察“贴图感”是否减轻。对比实验：关闭 GAUSSIAN_BLUR_ENABLED：过度模糊会严重破坏光照质感。将 ADAPTIVE_BOOST_MULTIPLIER 设为 1.0（关闭增强）：看是否是因为人工增强导致了亮度异常。下一步建议：你想让我为你修改 benchmark.py 或 camera.py 中的具体混合逻辑，以修复颜色空间导致的亮度过高问题吗？
+运行结果: 基准运行成功并完成（见终端日志）。输出目录： benchmark_results_20251226_172131，包含 benchmark_results.csv 和若干截图（例如 result_hybrid.png、after_displacement_*）。
+
+已实现:
+
+G-Buffer：在 camera.py 增加 normal_buffer 与 depth_buffer 并在命中时写入。
+A-SVGF：实现轻量级 asvgf_filter()（3x3 法线/深度/亮度引导滤波）并在 Hybrid 后调用。
+自适应采样：加入 adaptive_weight_map 与内核 compute_adaptive_weights(...)；在 experiment_config.py 添加参数 ADAPTIVE_BRIGHTNESS_THRESHOLD、ADAPTIVE_SAMPLING_MULTIPLIER、ADAPTIVE_MAX_MULTIPLIER。
+调整了网格更新（更多探针、指数平滑）与将模糊开关驱动自 experiment_config.py。
+关键文件: camera.py, experiment_config.py, main.py, benchmark.py
+
+下一步建议（选一）:
+
+我现在打开并预览 benchmark_results.csv；或
+我列出并展示几张 hybrid / after_displacement 的截图以比较滤波前后差异；或
+我帮你微调参数（例如调整 ADAPTIVE_BRIGHTNESS_THRESHOLD、ADAPTIVE_SAMPLING_MULTIPLIER、grid_samples_per_update、grid_probe_depth、grid_update_alpha）并再跑一次短时测试。

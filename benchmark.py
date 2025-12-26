@@ -167,6 +167,8 @@ def run_benchmark(scene_mode='cornell_box'):
             # Adaptive hybrid: apply reduced base update (1%)
             cam.update_grid(world, 0.01)
             cam.render(world, render_mode)
+            # Apply lightweight A-SVGF denoiser to hybrid output
+            cam.asvgf_filter()
         
         # Force synchronization after rendering to ensure completion
         ti.sync()
@@ -246,6 +248,12 @@ def run_benchmark(scene_mode='cornell_box'):
         gui.text(f"Data: {len(benchmark_data)} records", (0.05, 0.75))
         
         gui.show()
+
+        # Update adaptive sampling weights for next frame
+        import experiment_config as cfg
+        cam.compute_adaptive_weights(cfg.ADAPTIVE_BRIGHTNESS_THRESHOLD,
+                         cfg.ADAPTIVE_SAMPLING_MULTIPLIER,
+                         cfg.ADAPTIVE_MAX_MULTIPLIER)
         
         # Dynamic displacement trigger: at frame 150, move the light source (only once per mode)
         if current_mode_frames == 150 and not displacement_occurred and len(spheres) > 0:

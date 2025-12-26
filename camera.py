@@ -91,6 +91,20 @@ class Camera:
         # accumulator for MSE kernel
         self._mse_acc = ti.field(dtype=ti.f32, shape=())
 
+        # G-Buffer: normals (vec3) and depth (float)
+        self.normal_buffer = ti.Vector.field(n=3, dtype=ti.f32, shape=self.img_res)
+        self.depth_buffer = ti.field(dtype=ti.f32, shape=self.img_res)
+        # denoised output buffer for A-SVGF
+        self.denoised_frame = ti.Vector.field(n=3, dtype=ti.f32, shape=self.img_res)
+
+        # Adaptive sampling weight map (>=1.0). Starts neutral (1.0)
+        self.adaptive_weight_map = ti.field(dtype=ti.f32, shape=self.img_res)
+        self.adaptive_weight_map.fill(1.0)
+
+        # sampling configuration
+        self.base_samples = self.samples_per_pixel
+        self.max_samples_per_pixel = max(8, int(self.base_samples * 2))
+
         # Irradiance grid for storing spatial lighting information
         # `self.grid_res` set above from config
         # Define grid origin and cell size (world-space AABB)
@@ -106,24 +120,36 @@ class Camera:
 
     @ti.kernel
     def render(self, world: ti.template(), mode: ti.i32):
-        # Main rendering loop, mode: 0=PT, 1=Grid, 2=Adaptive
+        # Main rendering loop, supports adaptive per-pixel sample counts
         for x, y in self.frame:
-            pixel_color = vec3(0, 0, 0)
-            for _ in range(self.samples_per_pixel):
-                view_ray = self.get_ray(x, y)
-                if mode == 0:
-                    pixel_color += self.get_ray_color_pt(view_ray, world) / self.samples_per_pixel
-                elif mode == 1:
-                    pixel_color += self.get_ray_color_grid(view_ray, world) / self.samples_per_pixel
-                else:
-                    pixel_color += self.get_ray_color_hybrid(view_ray, world) / self.samples_per_pixel
-            self.frame[x, y] = pixel_color
+            acc = vec3(0.0)
+            # determine local samples from adaptive weight map
+            local_w = self.adaptive_weight_map[x, y]
+            local_samples = int(self.base_samples * local_w)
+            if local_samples <= 0:
+                local_samples = 1
+            if local_samples > self.max_samples_per_pixel:
+                local_samples = self.max_samples_per_pixel
+
+            # perform up to max_samples_per_pixel probes, only accumulate active ones
+            for s in range(self.max_samples_per_pixel):
+                if s < local_samples:
+                    view_ray = self.get_ray(x, y)
+                    if mode == 0:
+                        acc += self.get_ray_color_pt(view_ray, world, x, y)
+                    elif mode == 1:
+                        acc += self.get_ray_color_grid(view_ray, world, x, y)
+                    else:
+                        acc += self.get_ray_color_hybrid(view_ray, world, x, y)
+
+            # Store averaged color
+            self.frame[x, y] = acc / float(local_samples)
 
     @ti.kernel
     def render_pt(self, world: ti.template()):
         # Render a single-sample PT baseline into pt_frame
         for x, y in self.pt_frame:
-            self.pt_frame[x, y] = self.get_ray_color_pt(self.get_ray(x, y), world)
+            self.pt_frame[x, y] = self.get_ray_color_pt(self.get_ray(x, y), world, x, y)
 
     @ti.kernel
     def compute_mse(self) -> ti.f32:
@@ -239,7 +265,7 @@ class Camera:
 
     # === Path Tracing (Ground-Truth) ===
     @ti.func
-    def get_ray_color_pt(self, ray: Ray, world: ti.template()) -> vec3:
+    def get_ray_color_pt(self, ray: Ray, world: ti.template(), px: ti.i32, py: ti.i32) -> vec3:
         """经典递归/迭代 Path Tracing，不使用光照网格，用作真值。"""
         attenuation = vec3(1.0)
         current_ray = ray
@@ -247,6 +273,9 @@ class Camera:
         for _ in range(self.max_ray_depth):
             hit = world.hit_world(current_ray, 0.001, tm.inf)
             if hit.did_hit:
+                # store G-buffer info for the pixel
+                self.normal_buffer[px, py] = hit.record.normal
+                self.depth_buffer[px, py] = hit.record.t
                 scatter_ret = world.materials.scatter(current_ray, hit.record)
                 if scatter_ret.did_scatter:
                     attenuation *= scatter_ret.attenuation
@@ -260,34 +289,45 @@ class Camera:
                 # 抵达背景
                 env = self.get_background_color(current_ray.direction)
                 color = attenuation * env
+                # background: mark depth as large and normal as zero
+                self.normal_buffer[px, py] = vec3(0.0, 0.0, 0.0)
+                self.depth_buffer[px, py] = 1e9
                 break
         return color
 
     # === 纯网格模式 ===
     @ti.func
-    def get_ray_color_grid(self, ray: Ray, world: ti.template()) -> vec3:
+    def get_ray_color_grid(self, ray: Ray, world: ti.template(), px: ti.i32, py: ti.i32) -> vec3:
         hit = world.hit_world(ray, 0.001, tm.inf)
         color = vec3(0.0)
         if hit.did_hit:
+            # store G-buffer
+            self.normal_buffer[px, py] = hit.record.normal
+            self.depth_buffer[px, py] = hit.record.t
             # Check if this is a light source
             mat_idx = world.materials.mat_index[hit.record.id]
             if mat_idx == world.materials.DIFFUSE_LIGHT:
                 # Direct light emission
                 color = world.materials.albedo[hit.record.id]
             else:
-                # Sample irradiance grid for non-light sources
+                # Sample irradiance grid for non-light sources (use surface normal)
                 color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
         else:
             color = self.get_background_color(ray.direction)
+            self.normal_buffer[px, py] = vec3(0.0, 0.0, 0.0)
+            self.depth_buffer[px, py] = 1e9
         return color
 
     # === 混合模式（自适应） ===
     @ti.func
-    def get_ray_color_hybrid(self, ray: Ray, world: ti.template()) -> vec3:
+    def get_ray_color_hybrid(self, ray: Ray, world: ti.template(), px: ti.i32, py: ti.i32) -> vec3:
         color = vec3(0.0, 0.0, 0.0)
         hit = world.hit_world(ray, 0.001, tm.inf)
 
         if hit.did_hit:
+            # store G-buffer
+            self.normal_buffer[px, py] = hit.record.normal
+            self.depth_buffer[px, py] = hit.record.t
             mat_idx = world.materials.mat_index[hit.record.id]
 
             # Handle light sources directly
@@ -368,6 +408,8 @@ class Camera:
         else:
             # Background color
             color = self.get_background_color(ray.direction)
+            self.normal_buffer[px, py] = vec3(0.0, 0.0, 0.0)
+            self.depth_buffer[px, py] = 1e9
 
         return color
 
@@ -528,6 +570,87 @@ class Camera:
         # Copy back
         for i, j, k in ti.ndrange(self.grid_res[0], self.grid_res[1], self.grid_res[2]):
             self.grid_update_weight[i, j, k] = self.grid_update_weight_tmp[i, j, k]
+
+    # --- Lightweight A-SVGF spatial filter (uses normals & depth to preserve edges) ---
+    @ti.kernel
+    def asvgf_filter(self):
+        # small 3x3 bilateral-like filter guided by normal/depth
+        for i, j in self.frame:
+            c0 = self.frame[i, j]
+            n0 = self.normal_buffer[i, j]
+            d0 = self.depth_buffer[i, j]
+            sum_c = vec3(0.0)
+            sum_w = 0.0
+
+            for di in ti.static(range(-1, 2)):
+                for dj in ti.static(range(-1, 2)):
+                    ni = i + di
+                    nj = j + dj
+                    if 0 <= ni < self.img_res[0] and 0 <= nj < self.img_res[1]:
+                        c1 = self.frame[ni, nj]
+                        n1 = self.normal_buffer[ni, nj]
+                        d1 = self.depth_buffer[ni, nj]
+
+                        # spatial weight (based on Manhattan distance)
+                        dist2 = float(di * di + dj * dj)
+                        spatial_w = tm.exp(-dist2 * 0.5)
+
+                        # normal alignment weight (preserve edges)
+                        n_dot = n0.dot(n1)
+                        if n_dot < 0.0:
+                            n_dot = 0.0
+
+                        # depth similarity weight
+                        depth_diff = d0 - d1
+                        depth_w = tm.exp(- (depth_diff * depth_diff) * 50.0)
+
+                        # color similarity (luminance) weight
+                        lum0 = 0.2126 * c0[0] + 0.7152 * c0[1] + 0.0722 * c0[2]
+                        lum1 = 0.2126 * c1[0] + 0.7152 * c1[1] + 0.0722 * c1[2]
+                        col_diff = lum0 - lum1
+                        color_w = tm.exp(- (col_diff * col_diff) * 200.0)
+
+                        w = spatial_w * n_dot * depth_w * color_w
+                        sum_c += c1 * w
+                        sum_w += w
+
+            if sum_w > 0.0:
+                self.denoised_frame[i, j] = sum_c / sum_w
+            else:
+                self.denoised_frame[i, j] = c0
+
+        # copy back
+        for i, j in self.frame:
+            self.frame[i, j] = self.denoised_frame[i, j]
+
+    @ti.kernel
+    def compute_adaptive_weights(self, threshold: ti.f32, multiplier: ti.f32, max_mul: ti.f32):
+        # Simple local contrast-based adaptive weight map
+        for i, j in self.frame:
+            c0 = self.frame[i, j]
+            lum0 = 0.2126 * c0[0] + 0.7152 * c0[1] + 0.0722 * c0[2]
+            max_l = lum0
+            min_l = lum0
+            for di in ti.static(range(-1, 2)):
+                for dj in ti.static(range(-1, 2)):
+                    ni = i + di
+                    nj = j + dj
+                    if 0 <= ni < self.img_res[0] and 0 <= nj < self.img_res[1]:
+                        cn = self.frame[ni, nj]
+                        l = 0.2126 * cn[0] + 0.7152 * cn[1] + 0.0722 * cn[2]
+                        if l > max_l:
+                            max_l = l
+                        if l < min_l:
+                            min_l = l
+            contrast = max_l - min_l
+            # initialize weight then increase when contrast exceeds threshold
+            w = 1.0
+            if contrast > threshold:
+                w = w + multiplier
+            # clamp
+            if w > max_mul:
+                w = max_mul
+            self.adaptive_weight_map[i, j] = w
 
     def adapt_grid_to_scene(self, spheres: ti.template(), verbose: bool = False):
         """

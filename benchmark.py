@@ -316,9 +316,19 @@ def run_benchmark(scene_mode='cornell_box'):
 
 @ti.kernel
 def average_frames(current_frame: ti.template(), new_frame: ti.template(), weight: float):
-    """Average frames for progressive rendering"""
+    """Average frames for progressive rendering (do averaging in linear space).
+
+    We keep `current_frame` stored as gamma for compatibility, so we:
+    1. convert the stored gamma `current_frame` back to linear,
+    2. average with the incoming `new_frame` (assumed linear),
+    3. convert the result back to gamma and store.
+    This prevents double-gamma application which causes brightness blowup.
+    """
     for i, j in new_frame:
-        current_frame[i, j] = (1.0 - weight) * current_frame[i, j] + weight * utils.linear_to_gamma_vec3(new_frame[i, j])
+        curr_linear = utils.gamma_to_linear_vec3(current_frame[i, j])
+        new_linear = new_frame[i, j]
+        avg_linear = (1.0 - weight) * curr_linear + weight * new_linear
+        current_frame[i, j] = utils.linear_to_gamma_vec3(avg_linear)
 
 def flush_benchmark_data():
     """Flush any pending benchmark data to CSV immediately"""

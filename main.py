@@ -9,6 +9,7 @@ import time
 import os
 import csv
 from datetime import datetime
+import experiment_config as cfg
 
 # Initialize Taichi with fixed RNG seed for reproducibility
 ti.init(arch=ti.gpu, random_seed=42)
@@ -270,7 +271,7 @@ def main():
         for midx in moved_indices:
             center = spheres[midx].center
             influence = spheres[midx].radius * 3.0
-            cam.boost_weights_region([float(center[0]), float(center[1]), float(center[2])], influence, 3.0)
+            cam.boost_weights_region([float(center[0]), float(center[1]), float(center[2])], influence, cfg.ADAPTIVE_BOOST_MULTIPLIER)
 
         # After boosting, smooth weights to avoid hard seams
         if len(moved_indices) > 0:

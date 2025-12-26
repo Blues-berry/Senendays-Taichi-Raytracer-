@@ -2,6 +2,7 @@ import taichi as ti
 import taichi.math as tm
 import math
 import utils
+import experiment_config as cfg
 from ray import Ray
 
 vec3 = ti.types.vector(3, float)
@@ -42,6 +43,13 @@ class Camera:
 
         self.samples_per_pixel = 5
         self.max_ray_depth = 500
+
+        # Grid / probe tuning (configurable)
+        self.grid_res = cfg.GRID_RESOLUTION
+        self.grid_samples_per_update = 4
+        self.grid_probe_depth = 3
+        self.grid_update_alpha = 0.5
+        self.gaussian_blur_enabled = cfg.GAUSSIAN_BLUR_ENABLED
 
         # Use parameters passed into constructor (do not overwrite)
         # `vfov`, `lookfrom`, `lookat`, `vup`, `defocus_angle`, `focus_dist`
@@ -84,7 +92,7 @@ class Camera:
         self._mse_acc = ti.field(dtype=ti.f32, shape=())
 
         # Irradiance grid for storing spatial lighting information
-        self.grid_res = (32, 32, 32)
+        # `self.grid_res` set above from config
         # Define grid origin and cell size (world-space AABB)
         self.grid_origin = vec3(-8.0, -1.0, -8.0)
         self.grid_cell_size = 1.0
@@ -138,7 +146,7 @@ class Camera:
         return self.camera_origin + self.defocus_disk_u * p[0] + self.defocus_disk_v * p[1]
 
     @ti.func
-    def sample_irradiance_grid(self, p: vec3, world: ti.template(), fallback_id: int) -> vec3:
+    def sample_irradiance_grid(self, p: vec3, world: ti.template(), fallback_id: int, normal: vec3) -> vec3:
         # Map world position to grid-space continuous coordinates
         local = p - self.grid_origin
         fx = local[0] / self.grid_cell_size
@@ -169,25 +177,64 @@ class Camera:
             iz1 = iz0 + 1
 
             # fetch the 8 neighbors
-            c000 = self.irradiance_grid[ix0, iy0, iz0]
-            c100 = self.irradiance_grid[ix1, iy0, iz0]
-            c010 = self.irradiance_grid[ix0, iy1, iz0]
-            c110 = self.irradiance_grid[ix1, iy1, iz0]
-            c001 = self.irradiance_grid[ix0, iy0, iz1]
-            c101 = self.irradiance_grid[ix1, iy0, iz1]
-            c011 = self.irradiance_grid[ix0, iy1, iz1]
-            c111 = self.irradiance_grid[ix1, iy1, iz1]
+            # For better angular correctness, weight each neighbor by
+            # alignment between surface normal and direction to that cell center.
+            # Accumulate weighted color and normalize by total weight.
+            sum_col = vec3(0.0)
+            sum_w = 0.0
 
-            # trilinear interpolation
-            c00 = c000 * (1.0 - tx) + c100 * tx
-            c10 = c010 * (1.0 - tx) + c110 * tx
-            c01 = c001 * (1.0 - tx) + c101 * tx
-            c11 = c011 * (1.0 - tx) + c111 * tx
+            for di in ti.static(range(2)):
+                for dj in ti.static(range(2)):
+                    for dk in ti.static(range(2)):
+                        xi = ix0 + di
+                        yj = iy0 + dj
+                        zk = iz0 + dk
+                        nc = self.irradiance_grid[xi, yj, zk]
 
-            c0 = c00 * (1.0 - ty) + c10 * ty
-            c1 = c01 * (1.0 - ty) + c11 * ty
+                        # cell center
+                        cell_center = self.grid_origin + vec3((xi + 0.5) * self.grid_cell_size,
+                                                              (yj + 0.5) * self.grid_cell_size,
+                                                              (zk + 0.5) * self.grid_cell_size)
+                        dir_to_cell = cell_center - p
+                        # small safe norm
+                        denom = tm.sqrt(dir_to_cell.dot(dir_to_cell)) + 1e-8
+                        dir_n = dir_to_cell / denom
+                        cos = normal.dot(dir_n)
+                        if cos < 0.0:
+                            cos = 0.0
 
-            color = c0 * (1.0 - tz) + c1 * tz
+                        # trilinear weight for this corner
+                        wx = tx if di == 1 else (1.0 - tx)
+                        wy = ty if dj == 1 else (1.0 - ty)
+                        wz = tz if dk == 1 else (1.0 - tz)
+                        tri_w = wx * wy * wz
+
+                        w = tri_w * cos
+                        sum_col += nc * w
+                        sum_w += w
+
+            if sum_w > 0.0:
+                color = sum_col / sum_w
+            else:
+                # fallback to standard trilinear if normal weighting zeroed everything
+                c000 = self.irradiance_grid[ix0, iy0, iz0]
+                c100 = self.irradiance_grid[ix1, iy0, iz0]
+                c010 = self.irradiance_grid[ix0, iy1, iz0]
+                c110 = self.irradiance_grid[ix1, iy1, iz0]
+                c001 = self.irradiance_grid[ix0, iy0, iz1]
+                c101 = self.irradiance_grid[ix1, iy0, iz1]
+                c011 = self.irradiance_grid[ix0, iy1, iz1]
+                c111 = self.irradiance_grid[ix1, iy1, iz1]
+
+                c00 = c000 * (1.0 - tx) + c100 * tx
+                c10 = c010 * (1.0 - tx) + c110 * tx
+                c01 = c001 * (1.0 - tx) + c101 * tx
+                c11 = c011 * (1.0 - tx) + c111 * tx
+
+                c0 = c00 * (1.0 - ty) + c10 * ty
+                c1 = c01 * (1.0 - ty) + c11 * ty
+
+                color = c0 * (1.0 - tz) + c1 * tz
         return color
 
     # === Path Tracing (Ground-Truth) ===
@@ -229,7 +276,7 @@ class Camera:
                 color = world.materials.albedo[hit.record.id]
             else:
                 # Sample irradiance grid for non-light sources
-                color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id)
+                color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
         else:
             color = self.get_background_color(ray.direction)
         return color
@@ -249,11 +296,42 @@ class Camera:
                 color = world.materials.albedo[hit.record.id]
             else:
                 # Sample grid for ambient term or primary color
-                grid_color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id)
+                grid_color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
 
+                # Direct illumination: cast shadow rays to each emissive entity
+                direct = vec3(0.0)
+                # iterate over world.entities to find lights
+                for li in range(world.entities.shape[0]):
+                    lm_idx = world.materials.mat_index[li]
+                    if lm_idx == world.materials.DIFFUSE_LIGHT:
+                        light_center = world.entities[li].center
+                        light_radius = world.entities[li].radius
+                        to_light = light_center - hit.record.p
+                        dist2 = to_light.dot(to_light)
+                        dist = tm.sqrt(dist2)
+                        if dist < 1e-6:
+                            continue
+                        ldir = to_light / dist
+
+                        # shadow test: if any geometry intersects between point and light center
+                        shadow_ray = Ray(origin=hit.record.p + ldir * 0.0005, direction=ldir)
+                        shadow_hit = world.hit_world(shadow_ray, 0.001, dist - light_radius)
+                        if shadow_hit.did_hit:
+                            # occluded
+                            pass
+                        else:
+                            # simple lambert + inverse-square approx
+                            cos = hit.record.normal.dot(ldir)
+                            if cos > 0.0:
+                                emission = world.materials.albedo[li]
+                                # approximate geometric falloff by inverse-square and scale by light size
+                                att = cos / (dist2 + 1e-6)
+                                direct += emission * att
+
+                # For lambertian surfaces, prefer direct + indirect composition
                 if mat_idx == world.materials.LAMBERT:
-                    # For Lambertian, the color is primarily from the grid
-                    color = grid_color
+                    # Combine direct (sharp shadows/highlights) with indirect (from grid)
+                    color = direct + grid_color
                 else:  # Metal or Dielectric
                     # For specular materials, trace further and add ambient term
                     bounced_color = vec3(0.0)
@@ -272,7 +350,7 @@ class Camera:
                                 current_hit_record = bounce_hit.record
                                 # If the bounce hits a diffuse surface, sample grid and terminate
                                 if world.materials.mat_index[bounce_hit.record.id] == world.materials.LAMBERT:
-                                    bounced_color = attenuation * self.sample_irradiance_grid(bounce_hit.record.p, world, bounce_hit.record.id)
+                                    bounced_color = attenuation * self.sample_irradiance_grid(bounce_hit.record.p, world, bounce_hit.record.id, bounce_hit.record.normal)
                                     break
                             else:
                                 # Ray escaped to background
@@ -341,36 +419,41 @@ class Camera:
                 pos = self.grid_origin + vec3((i + 0.5) * self.grid_cell_size,
                                              (j + 0.5) * self.grid_cell_size,
                                              (k + 0.5) * self.grid_cell_size)
-                # cast a random probe ray and allow one additional bounce (2-bounce probe)
-                dir = utils.random_unit_vector()
-                r = Ray(origin=pos, direction=dir)
-                hit = world.hit_world(r, 0.001, tm.inf)
-                col = vec3(0.0, 0.0, 0.0)
-                if hit.did_hit:
-                    # first-hit material
-                    scatter_ret = world.materials.scatter(r, hit.record)
-                    if scatter_ret.did_scatter:
-                        # second ray from scattered direction
-                        origin2 = scatter_ret.scattered.origin + tm.normalize(scatter_ret.scattered.direction) * 0.0002
-                        r2 = Ray(origin=origin2, direction=scatter_ret.scattered.direction)
-                        hit2 = world.hit_world(r2, 0.001, tm.inf)
-                        if hit2.did_hit:
-                            col = scatter_ret.attenuation * world.materials.albedo[hit2.record.id]
+                # multiple probes per update for higher-quality estimates
+                acc_col = vec3(0.0)
+                for s in range(ti.static(self.grid_samples_per_update)):
+                    dir = utils.random_unit_vector()
+                    r = Ray(origin=pos, direction=dir)
+                    col = vec3(0.0, 0.0, 0.0)
+                    # probe with limited depth
+                    cur_ray = r
+                    att = vec3(1.0)
+                    for depth in range(ti.static(self.grid_probe_depth)):
+                        hit = world.hit_world(cur_ray, 0.001, tm.inf)
+                        if hit.did_hit:
+                            scatter_ret = world.materials.scatter(cur_ray, hit.record)
+                            if scatter_ret.did_scatter:
+                                att = att * scatter_ret.attenuation
+                                cur_ray = Ray(origin=scatter_ret.scattered.origin + tm.normalize(scatter_ret.scattered.direction) * 0.0002,
+                                              direction=scatter_ret.scattered.direction)
+                                # continue probing
+                                continue
+                            else:
+                                # hit emissive or absorbing material
+                                col = att * scatter_ret.attenuation
+                                break
                         else:
-                            # second ray missed -> use environment color attenuated
-                            unit_direction = r2.direction.normalized()
-                            a = 0.5 * (unit_direction[1] + 1.0)
-                            env = self.get_background_color(r2.direction)
-                            col = scatter_ret.attenuation * env
-                    else:
-                        # no scatter: use albedo (local) only
-                        col = world.materials.albedo[hit.record.id]
-                    self.irradiance_grid[i, j, k] = col
-                else:
-                    # sample environment color
-                    unit_direction = dir.normalized()
-                    a = 0.5 * (unit_direction[1] + 1.0)
-                    self.irradiance_grid[i, j, k] = (1.0 - a) * vec3(1.0, 1.0, 1.0) + a * vec3(0.5, 0.7, 1.0)
+                            # environment
+                            env = self.get_background_color(cur_ray.direction)
+                            col = att * env
+                            break
+                    acc_col += col
+
+                new_col = acc_col / float(self.grid_samples_per_update)
+                # exponential smoothing with alpha
+                old = self.irradiance_grid[i, j, k]
+                a = self.grid_update_alpha
+                self.irradiance_grid[i, j, k] = old * (1.0 - a) + new_col * a
 
     @ti.kernel
     def boost_weights_region(self, cx: vec3, influence: float, multiplier: float):
@@ -387,8 +470,14 @@ class Camera:
             if dx * dx + dy * dy + dz * dz <= inf2:
                 self.grid_update_weight[i, j, k] = self.grid_update_weight[i, j, k] * multiplier
 
-    @ti.kernel
     def blur_update_weights(self):
+        # Python wrapper: only run kernel if blur enabled in config
+        if not self.gaussian_blur_enabled:
+            return
+        self._blur_update_weights_kernel()
+
+    @ti.kernel
+    def _blur_update_weights_kernel(self):
         # Gaussian blur with 3x3x3 kernel for smoother weight transitions
         # Using approximate Gaussian weights:
         # - Center: 0.4

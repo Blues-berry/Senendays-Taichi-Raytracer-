@@ -21,12 +21,12 @@ SAVE_SCREENSHOT_AFTER_MOVE_FRAME = 5     # Save screenshot N frames after sphere
 SAVE_SCREENSHOT_CONVERGED_FRAME = 50      # Save screenshot at frame N during convergence
 
 # Adaptive Logic Settings
-ADAPTIVE_BOOST_MULTIPLIER = 3.0          # Weight multiplier for adaptive regions
+ADAPTIVE_BOOST_MULTIPLIER = 1.0          # Weight multiplier for adaptive regions (reduced for testing)
 ADAPTIVE_INFLUENCE_RADIUS = 3.0          # Influence radius as multiple of sphere radius
-GAUSSIAN_BLUR_ENABLED = True             # Enable Gaussian blur for weight smoothing
+GAUSSIAN_BLUR_ENABLED = False            # Enable Gaussian blur for weight smoothing
 
 # Grid Settings
-GRID_RESOLUTION = (16, 16, 16)            # Grid resolution
+GRID_RESOLUTION = (32, 32, 32)            # Grid resolution
 GRID_PADDING = 0.5                        # Padding around scene AABB
 
 # Output Settings

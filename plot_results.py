@@ -273,36 +273,128 @@ def plot_mse_comparison(data, output_dir: str):
     plot_mse_over_time(rows, output_dir, title="MSE over time (log scale)")
 
 
+def _read_ablation_csv(csv_path: str):
+    rows = []
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append({"frame": int(r["frame"]), "mse": float(r["mse"])})
+    return rows
+
+
+def plot_ablation_mse_comparison(
+    results_dir: str,
+    out_dir: str,
+    groups=("Baseline", "V1", "V2", "Full_Hybrid"),
+    movement_frame: int = 200,
+):
+    """High-quality academic comparison plot for the ablation study."""
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Publication-ish defaults (still lightweight)
+    plt.rcParams.update(
+        {
+            "font.size": 12,
+            "axes.titlesize": 13,
+            "axes.labelsize": 12,
+            "legend.fontsize": 11,
+            "lines.linewidth": 2.0,
+        }
+    )
+
+    plt.figure(figsize=(6.5, 3.8))
+
+    palette = {
+        "Baseline": "#1f77b4",
+        "V1": "#ff7f0e",
+        "V2": "#2ca02c",
+        "Full_Hybrid": "#d62728",
+    }
+
+    for g in groups:
+        csv_path = os.path.join(results_dir, f"ablation_{g}.csv")
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"Missing ablation CSV: {csv_path}")
+
+        rows = _read_ablation_csv(csv_path)
+        frames = np.array([r["frame"] for r in rows], dtype=np.int64)
+        mse = np.array([r["mse"] for r in rows], dtype=np.float64)
+
+        # log-scale can't show <= 0
+        mask = mse > 0
+        if np.any(mask):
+            plt.semilogy(
+                frames[mask],
+                mse[mask],
+                label=g,
+                color=palette.get(g, None),
+                alpha=0.95,
+            )
+
+    # Movement marker
+    plt.axvline(movement_frame, color="#808080", linestyle="--", linewidth=1.5, alpha=0.9)
+    plt.text(
+        movement_frame + 3,
+        plt.ylim()[1] / 3.0,
+        "Object Movement",
+        color="#606060",
+        rotation=90,
+        va="top",
+        ha="left",
+    )
+
+    plt.xlabel("Frame")
+    plt.ylabel("MSE (log scale)")
+    plt.title("Ablation Study: MSE vs Frame")
+    plt.grid(True, which="both", linestyle="--", alpha=0.25)
+    plt.legend(loc="best", frameon=True)
+
+    out_pdf = os.path.join(out_dir, "ablation_mse_comparison.pdf")
+    plt.tight_layout()
+    plt.savefig(out_pdf, dpi=300, bbox_inches="tight")
+    print(f"Saved: {out_pdf}")
+
+
 def main():
-    """Main function to plot benchmark results"""
-    print("=== Raytracing Benchmark Results Plotter ===")
+    """Main function to plot benchmark / ablation results"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--results_dir",
+        type=str,
+        default=None,
+        help="Directory like results/benchmark_results_YYYYMMDD_HHMMSS (default: latest)",
+    )
+    args = parser.parse_args()
 
-    # Find the latest results directory
-    results_dir = find_latest_results_dir()
+    results_dir = args.results_dir or find_latest_results_dir()
     if not results_dir:
+        print("No results directory found under ./results")
         return
 
-    # Read benchmark data
-    data = read_benchmark_data(results_dir)
-    if not data:
-        return
-
-    # Create plots directory
     plots_dir = os.path.join(results_dir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
 
-    # Generate plots
-    print("\nGenerating MSE comparison plot...")
-    plot_mse_comparison(data, plots_dir)
+    print(f"Using results dir: {results_dir}")
 
-    print("\nGenerating detailed MSE analysis...")
-    plot_detailed_mse_analysis(data, plots_dir)
+    # 1) New: ablation comparison (4 CSVs)
+    try:
+        plot_ablation_mse_comparison(results_dir, plots_dir)
+    except FileNotFoundError as e:
+        print(f"Ablation plot skipped: {e}")
 
-    print("\nGenerating summary report...")
-    generate_summary_report(data, plots_dir)
+    # 2) Backwards-compatible: legacy benchmark_results.csv plots if present
+    data = read_benchmark_data(results_dir)
+    if data:
+        print("\nGenerating legacy MSE comparison plot...")
+        plot_mse_comparison(data, plots_dir)
 
-    print(f"\nAll plots and reports saved to: {plots_dir}")
-    print("Plot generation completed successfully!")
+        print("\nGenerating detailed MSE analysis...")
+        plot_detailed_mse_analysis(data, plots_dir)
+
+        print("\nGenerating summary report...")
+        generate_summary_report(data, plots_dir)
+
+    print(f"\nAll plots saved to: {plots_dir}")
 
 if __name__ == "__main__":
     main()

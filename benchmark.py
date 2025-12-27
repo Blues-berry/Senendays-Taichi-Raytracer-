@@ -13,24 +13,40 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 # --- Experiment groups for ablation study ---
-# Baseline: interpolation OFF, light-guided probe sampling OFF
-# Optimized_V1: interpolation ON, light-guided probe sampling OFF
-# Full_Hybrid: interpolation ON, light-guided probe sampling ON
+# The ablation switches are:
+#   interpolation_on         (tri-linear interpolation)
+#   importance_sampling_on   (light importance sampling / light-guided probes)
+#   adaptive_logic_on        (adaptive weight update)
+#
+# Required runs (in order):
+#   Baseline      : all OFF
+#   V1            : interpolation only
+#   V2            : interpolation + adaptive
+#   Full_Hybrid   : all ON
 EXPERIMENT_GROUPS = [
     {
         "name": "Baseline",
-        "interpolate": False,
-        "light_guided": False,
+        "interpolation_on": False,
+        "importance_sampling_on": False,
+        "adaptive_logic_on": False,
     },
     {
-        "name": "Optimized_V1",
-        "interpolate": True,
-        "light_guided": False,
+        "name": "V1",
+        "interpolation_on": True,
+        "importance_sampling_on": False,
+        "adaptive_logic_on": False,
+    },
+    {
+        "name": "V2",
+        "interpolation_on": True,
+        "importance_sampling_on": False,
+        "adaptive_logic_on": True,
     },
     {
         "name": "Full_Hybrid",
-        "interpolate": True,
-        "light_guided": True,
+        "interpolation_on": True,
+        "importance_sampling_on": True,
+        "adaptive_logic_on": True,
     },
 ]
 
@@ -126,29 +142,88 @@ def plot_mse_curves(mse_by_group, out_path, title):
     plt.close()
 
 
-def run_group_experiments(scene_mode='cornell_box'):
-    """Run 3 experiment groups and output a single plot with 3 MSE curves."""
-    global frame_count, current_mode_frames, pt_reference, pt_reference_linear, world, cam, spheres, materials
+def _apply_ablation_toggles(group_cfg: dict):
+    """Apply ablation toggles to the camera.
 
+    This benchmark expects camera.py to expose:
+      - cam.interpolate_grid_sampling
+      - cam.enable_light_guided_probes
+
+    Adaptive logic is controlled in this benchmark by whether we call
+    cam.compute_adaptive_weights() each frame.
+    """
+    cam.interpolate_grid_sampling = bool(group_cfg.get("interpolation_on", False))
+    cam.enable_light_guided_probes = bool(group_cfg.get("importance_sampling_on", False))
+
+
+def _trigger_object_movement_at_frame(frame_idx: int, trigger_frame: int = 200) -> bool:
+    """Move the light sphere at a deterministic frame.
+
+    Returns True if movement was applied at this frame.
+    """
+    if frame_idx != trigger_frame:
+        return False
+    if len(spheres) <= 0:
+        return False
+
+    light_index = len(spheres) - 1
+    old_x = spheres[light_index].center[0]
+    spheres[light_index].center[0] = old_x + 1.0
+    log_message(
+        f"Object Movement @ frame {frame_idx}: light sphere x {old_x:.3f} -> {spheres[light_index].center[0]:.3f}"
+    )
+    return True
+
+
+def _write_group_csv(group_name: str, rows: list[dict]):
+    csv_path = os.path.join(output_dir, f"ablation_{group_name}.csv")
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=[
+                "frame",
+                "mse",
+                "fps",
+                "timestamp",
+                "interpolation_on",
+                "importance_sampling_on",
+                "adaptive_logic_on",
+                "movement_applied",
+            ],
+        )
+        w.writeheader()
+        w.writerows(rows)
+    log_message(f"Saved group CSV: {csv_path}")
+
+
+def run_group_experiments(scene_mode='cornell_box'):
+    """Run ablation study and output *four* CSV files (one per group)."""
+    global frame_count, current_mode_frames, pt_reference, pt_reference_linear, world, cam, spheres
+
+    # Keep an optional combined plot for quick inspection
     mse_by_group = {g['name']: [] for g in EXPERIMENT_GROUPS}
 
+    # Shared settings
+    movement_frame = 200
+    test_frames = 450
+
     for gi, g in enumerate(EXPERIMENT_GROUPS):
-        log_message(f"\n=== Running group {gi+1}/{len(EXPERIMENT_GROUPS)}: {g['name']} ===")
+        group_name = g["name"]
+        log_message(f"\n=== Running group {gi+1}/{len(EXPERIMENT_GROUPS)}: {group_name} ===")
 
         # Re-init scene for fairness (same camera/world setup)
         world, cam = main.setup_scene(scene_mode)
         cam.scene_mode = scene_mode
 
         # Apply feature toggles on camera
-        cam.interpolate_grid_sampling = bool(g['interpolate'])
-        cam.enable_light_guided_probes = bool(g['light_guided'])
+        _apply_ablation_toggles(g)
 
-        # Ensure the compact light list exists when light-guided is enabled
-        # (setup_scene usually calls set_light_sources; calling again is safe)
+        # Ensure the compact light list exists when importance sampling is enabled
         try:
-            cam.set_light_sources(spheres, materials)
+            # Some scene builders might not expose materials in this benchmark context.
+            # Calling with whatever globals exist is fine; failures are non-fatal.
+            cam.set_light_sources(spheres, globals().get("materials", None))
         except Exception:
-            # If the scene builder doesn't expose materials list in this benchmark context
             pass
 
         # Reset counters and references
@@ -170,45 +245,91 @@ def run_group_experiments(scene_mode='cornell_box'):
         ti.sync()
 
         # Capture PT reference for this group (short PT run)
-        # Keep it short to avoid tripling runtime too much.
         pt_ref_spp_frames = 150
         pt_accum = np.zeros((*cam.img_res, 3), dtype=np.float32)
-        for f in range(pt_ref_spp_frames):
+        for _ in range(pt_ref_spp_frames):
             cam.render_pt(world)
             ti.sync()
             pt_accum += cam.pt_frame.to_numpy().astype(np.float32)
         pt_reference_linear = pt_accum / float(pt_ref_spp_frames)
 
-        # Now run the tested method and record MSE per frame
-        test_frames = 450
+        # Main test loop (record MSE/FPS). Ensure identical movement trigger for all groups.
+        group_rows = []
+        movement_applied_flag = False
+
         for f in range(test_frames):
+            # Deterministic object movement at the same frame for every group
+            moved_this_frame = _trigger_object_movement_at_frame(f, movement_frame)
+            movement_applied_flag = movement_applied_flag or moved_this_frame
+
+            # If the scene changed, re-adapt grid (important for hybrid/grid correctness)
+            if moved_this_frame and COMPARE_RENDER_MODE in (RENDER_MODE_GRID, RENDER_MODE_HYBRID):
+                cam.adapt_grid_to_scene(spheres, verbose=False)
+
+            ti.sync()
+            start_time = time.perf_counter()
+
             if COMPARE_RENDER_MODE in (RENDER_MODE_GRID, RENDER_MODE_HYBRID):
                 cam.update_grid(world, 0.01)
             cam.render(world, COMPARE_RENDER_MODE)
             if COMPARE_RENDER_MODE == RENDER_MODE_HYBRID:
                 cam.asvgf_filter()
+
+            # Adaptive logic toggle: update weights only when enabled
+            if bool(g.get("adaptive_logic_on", False)):
+                import experiment_config as cfg
+
+                cam.compute_adaptive_weights(
+                    cfg.ADAPTIVE_BRIGHTNESS_THRESHOLD,
+                    cfg.ADAPTIVE_SAMPLING_MULTIPLIER,
+                    cfg.ADAPTIVE_MAX_MULTIPLIER,
+                )
+
             ti.sync()
+            frame_time = time.perf_counter() - start_time
+            fps = 1.0 / frame_time if frame_time > 1e-6 else 0.0
 
             current_linear = cam.frame.to_numpy()
             mse = calculate_accurate_mse(current_linear, pt_reference_linear)
-            mse_by_group[g['name']].append((f, mse))
 
-            # Keep GUI responsive if needed
+            mse_by_group[group_name].append((f, mse))
+            group_rows.append(
+                {
+                    "frame": int(f),
+                    "mse": float(mse),
+                    "fps": float(fps),
+                    "timestamp": datetime.now().isoformat(),
+                    "interpolation_on": bool(g.get("interpolation_on", False)),
+                    "importance_sampling_on": bool(g.get("importance_sampling_on", False)),
+                    "adaptive_logic_on": bool(g.get("adaptive_logic_on", False)),
+                    "movement_applied": bool(moved_this_frame),
+                }
+            )
+
+            # Optional GUI preview
             if gui.running:
                 weight = 1.0 / (f + 1)
                 average_frames(current_frame, cam.frame, weight)
                 gui.set_image(current_frame)
-                gui.text(f"Group: {g['name']}", (0.05, 0.95))
+                gui.text(f"Group: {group_name}", (0.05, 0.95))
                 gui.text(f"Mode: {get_mode_name(COMPARE_RENDER_MODE)}", (0.05, 0.90))
                 gui.text(f"Frame: {f+1}/{test_frames}", (0.05, 0.85))
                 gui.text(f"MSE: {mse:.6e}", (0.05, 0.80))
+                if f == movement_frame:
+                    gui.text("Object Movement", (0.05, 0.75), color=0xAAAAAA)
                 gui.show()
 
-        # Save a result screenshot per group
-        out_img = f"result_{g['name']}.png"
-        save_screenshot(gui, out_img)
+        if not movement_applied_flag:
+            log_message(
+                f"WARNING: movement was not applied for group {group_name}. Expected at frame {movement_frame}."
+            )
 
-    # Plot combined curves
+        _write_group_csv(group_name, group_rows)
+
+        # Save a result screenshot per group
+        save_screenshot(gui, f"result_{group_name}.png")
+
+    # Optional combined plot for quick inspection
     plot_path = os.path.join(output_dir, 'mse_curves_groups.png')
     plot_mse_curves(
         mse_by_group,

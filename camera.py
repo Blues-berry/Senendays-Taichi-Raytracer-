@@ -3,6 +3,7 @@ import taichi.math as tm
 import math
 import utils
 import experiment_config as cfg
+import material as mat
 from ray import Ray
 
 vec3 = ti.types.vector(3, float)
@@ -118,6 +119,13 @@ class Camera:
         # initialize weights to 1.0
         self.grid_update_weight.fill(1.0)
 
+        # Light source list for importance sampling (populated from Python)
+        self.max_light_sources = 64
+        self.light_count = ti.field(dtype=ti.i32, shape=())
+        self.light_centers = ti.Vector.field(n=3, dtype=ti.f32, shape=self.max_light_sources)
+        self.light_radii = ti.field(dtype=ti.f32, shape=self.max_light_sources)
+        self.light_count[None] = 0
+
     @ti.kernel
     def render(self, world: ti.template(), mode: ti.i32):
         # Main rendering loop, supports adaptive per-pixel sample counts
@@ -202,65 +210,26 @@ class Camera:
             iy1 = iy0 + 1
             iz1 = iz0 + 1
 
-            # fetch the 8 neighbors
-            # For better angular correctness, weight each neighbor by
-            # alignment between surface normal and direction to that cell center.
-            # Accumulate weighted color and normalize by total weight.
-            sum_col = vec3(0.0)
-            sum_w = 0.0
+            # fetch the 8 neighbors for standard trilinear interpolation
+            c000 = self.irradiance_grid[ix0, iy0, iz0]
+            c100 = self.irradiance_grid[ix1, iy0, iz0]
+            c010 = self.irradiance_grid[ix0, iy1, iz0]
+            c110 = self.irradiance_grid[ix1, iy1, iz0]
+            c001 = self.irradiance_grid[ix0, iy0, iz1]
+            c101 = self.irradiance_grid[ix1, iy0, iz1]
+            c011 = self.irradiance_grid[ix0, iy1, iz1]
+            c111 = self.irradiance_grid[ix1, iy1, iz1]
 
-            for di in ti.static(range(2)):
-                for dj in ti.static(range(2)):
-                    for dk in ti.static(range(2)):
-                        xi = ix0 + di
-                        yj = iy0 + dj
-                        zk = iz0 + dk
-                        nc = self.irradiance_grid[xi, yj, zk]
+            # standard trilinear interpolation
+            c00 = c000 * (1.0 - tx) + c100 * tx
+            c10 = c010 * (1.0 - tx) + c110 * tx
+            c01 = c001 * (1.0 - tx) + c101 * tx
+            c11 = c011 * (1.0 - tx) + c111 * tx
 
-                        # cell center
-                        cell_center = self.grid_origin + vec3((xi + 0.5) * self.grid_cell_size,
-                                                              (yj + 0.5) * self.grid_cell_size,
-                                                              (zk + 0.5) * self.grid_cell_size)
-                        dir_to_cell = cell_center - p
-                        # small safe norm
-                        denom = tm.sqrt(dir_to_cell.dot(dir_to_cell)) + 1e-8
-                        dir_n = dir_to_cell / denom
-                        cos = normal.dot(dir_n)
-                        if cos < 0.0:
-                            cos = 0.0
+            c0 = c00 * (1.0 - ty) + c10 * ty
+            c1 = c01 * (1.0 - ty) + c11 * ty
 
-                        # trilinear weight for this corner
-                        wx = tx if di == 1 else (1.0 - tx)
-                        wy = ty if dj == 1 else (1.0 - ty)
-                        wz = tz if dk == 1 else (1.0 - tz)
-                        tri_w = wx * wy * wz
-
-                        w = tri_w * cos
-                        sum_col += nc * w
-                        sum_w += w
-
-            if sum_w > 0.0:
-                color = sum_col / sum_w
-            else:
-                # fallback to standard trilinear if normal weighting zeroed everything
-                c000 = self.irradiance_grid[ix0, iy0, iz0]
-                c100 = self.irradiance_grid[ix1, iy0, iz0]
-                c010 = self.irradiance_grid[ix0, iy1, iz0]
-                c110 = self.irradiance_grid[ix1, iy1, iz0]
-                c001 = self.irradiance_grid[ix0, iy0, iz1]
-                c101 = self.irradiance_grid[ix1, iy0, iz1]
-                c011 = self.irradiance_grid[ix0, iy1, iz1]
-                c111 = self.irradiance_grid[ix1, iy1, iz1]
-
-                c00 = c000 * (1.0 - tx) + c100 * tx
-                c10 = c010 * (1.0 - tx) + c110 * tx
-                c01 = c001 * (1.0 - tx) + c101 * tx
-                c11 = c011 * (1.0 - tx) + c111 * tx
-
-                c0 = c00 * (1.0 - ty) + c10 * ty
-                c1 = c01 * (1.0 - ty) + c11 * ty
-
-                color = c0 * (1.0 - tz) + c1 * tz
+            color = c0 * (1.0 - tz) + c1 * tz
         return color
 
     # === Path Tracing (Ground-Truth) ===
@@ -450,6 +419,10 @@ class Camera:
             color = self.get_background_color(ray.direction)
         return ray_return(hit_surface=hit.did_hit, resulting_ray=resulting_ray, color=color)
 
+    @ti.func
+    def make_ray(self, origin: vec3, direction: vec3) -> Ray:
+        return Ray(origin=origin, direction=direction)
+
     @ti.kernel
     def update_grid(self, world: ti.template(), base_prob: float):
         # Randomly update ~base_prob of the grid, scaled by per-cell weight
@@ -464,8 +437,33 @@ class Camera:
                 # multiple probes per update for higher-quality estimates
                 acc_col = vec3(0.0)
                 for s in range(ti.static(self.grid_samples_per_update)):
-                    dir = utils.random_unit_vector()
-                    r = Ray(origin=pos, direction=dir)
+                    # 50% of probes: random hemisphere/sample; 50%: direct toward a sampled light bbox (NEE)
+                    # preinitialize direction to avoid uninitialized-variable paths
+                    d = vec3(0.0)
+                    use_light = False
+                    if ti.random(ti.f32) < 0.5 and self.light_count[None] > 0:
+                        use_light = True
+
+                    if use_light:
+                        # pick a random light from the list
+                        li = int(ti.floor(ti.random(ti.f32) * self.light_count[None]))
+                        lc = self.light_centers[li]
+                        lr = self.light_radii[li]
+                        # sample a point inside the light's bounding box (approximate importance)
+                        rx = (ti.random(ti.f32) * 2.0 - 1.0) * lr
+                        ry = (ti.random(ti.f32) * 2.0 - 1.0) * lr
+                        rz = (ti.random(ti.f32) * 2.0 - 1.0) * lr
+                        target = vec3(lc[0] + rx, lc[1] + ry, lc[2] + rz)
+                        dir_vec = target - pos
+                        dist2 = dir_vec.dot(dir_vec)
+                        if dist2 < 1e-12:
+                            d = utils.random_unit_vector()
+                        else:
+                            d = dir_vec / tm.sqrt(dist2)
+                    else:
+                        d = utils.random_unit_vector()
+
+                    r = self.make_ray(pos, d)
                     col = vec3(0.0, 0.0, 0.0)
                     # probe with limited depth
                     cur_ray = r
@@ -476,13 +474,18 @@ class Camera:
                             scatter_ret = world.materials.scatter(cur_ray, hit.record)
                             if scatter_ret.did_scatter:
                                 att = att * scatter_ret.attenuation
-                                cur_ray = Ray(origin=scatter_ret.scattered.origin + tm.normalize(scatter_ret.scattered.direction) * 0.0002,
-                                              direction=scatter_ret.scattered.direction)
+                                cur_ray = self.make_ray(scatter_ret.scattered.origin + tm.normalize(scatter_ret.scattered.direction) * 0.0002,
+                                                       scatter_ret.scattered.direction)
                                 # continue probing
                                 continue
                             else:
                                 # hit emissive or absorbing material
-                                col = att * scatter_ret.attenuation
+                                midx = world.materials.mat_index[hit.record.id]
+                                emitted = scatter_ret.attenuation
+                                if midx == world.materials.DIFFUSE_LIGHT:
+                                    col = att * emitted * cfg.LIGHT_IMPORTANCE_SCALE
+                                else:
+                                    col = att * emitted
                                 break
                         else:
                             # environment
@@ -737,3 +740,27 @@ class Camera:
             print(f"Grid coverage: {nx*cell:.2f} x {ny*cell:.2f} x {nz*cell:.2f}")
             print(f"Total spheres: {len(spheres)}")
             print("=====================\n")
+
+    def set_light_sources(self, spheres: ti.template(), materials_list: ti.template()):
+        """
+        Build a compact list of emissive scene objects (Python-side).
+        `spheres` and `materials_list` are the same Python lists used to construct the World.
+        This populates `light_centers`, `light_radii` and `light_count` fields so
+        that Taichi kernels can perform Next-Event Estimation (NEE).
+        """
+        count = 0
+        maxl = int(self.max_light_sources)
+        for i, s in enumerate(spheres):
+            if count >= maxl:
+                break
+            m = materials_list[i]
+            # Detect emissive materials by comparing material index
+            if hasattr(m, 'index') and m.index == mat.Materials.DIFFUSE_LIGHT:
+                # store center and radius (as floats)
+                c = s.center
+                self.light_centers[count] = [float(c[0]), float(c[1]), float(c[2])]
+                self.light_radii[count] = float(s.radius)
+                count += 1
+
+        # write back the count
+        self.light_count[None] = count

@@ -34,6 +34,9 @@ ADAPTIVE_BRIGHTNESS_THRESHOLD = 0.05      # Luminance contrast threshold to trig
 ADAPTIVE_SAMPLING_MULTIPLIER = 1.0         # Additional multiplier when above threshold (adds to 1.0)
 ADAPTIVE_MAX_MULTIPLIER = 2.0             # Cap multiplier (so weight <= 1 + this)
 
+# Importance sampling / NEE
+LIGHT_IMPORTANCE_SCALE = 2.0              # Scale applied to emissive hits during grid probing
+
 # Output Settings
 OUTPUT_DIRECTORY = "experiment_results"
 SAVE_FPS_DATA = True

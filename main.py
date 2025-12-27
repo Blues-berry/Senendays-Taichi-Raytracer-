@@ -184,6 +184,8 @@ def setup_scene(mode: str = 'random'):
 
     print(f"Initializing scene: {mode}")
     cam.adapt_grid_to_scene(spheres, verbose=True)
+    # Populate camera-side light source list for importance sampling (NEE)
+    cam.set_light_sources(spheres, materials)
 
     # Identify large spheres (to monitor for movement) and store previous centers
     big_indices = []

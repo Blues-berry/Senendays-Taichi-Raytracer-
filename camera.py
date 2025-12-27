@@ -114,10 +114,20 @@ class Camera:
         self.irradiance_grid = ti.Vector.field(n=3, dtype=ti.f32, shape=self.grid_res)
         # Per-cell weight multiplier for update probability (default 1.0)
         self.grid_update_weight = ti.field(dtype=ti.f32, shape=self.grid_res)
+        # Per-cell luminance mean and variance for variance-guided updates
+        self.irradiance_mean_lum = ti.field(dtype=ti.f32, shape=self.grid_res)
+        self.irradiance_variance = ti.field(dtype=ti.f32, shape=self.grid_res)
+        # Per-cell mean hit distance for leak detection
+        self.grid_mean_distance = ti.field(dtype=ti.f32, shape=self.grid_res)
         # Temporary buffer for weight blur
         self.grid_update_weight_tmp = ti.field(dtype=ti.f32, shape=self.grid_res)
         # initialize weights to 1.0
         self.grid_update_weight.fill(1.0)
+        # initialize variance/mean/distance defaults
+        self.irradiance_mean_lum.fill(0.0)
+        self.irradiance_variance.fill(0.0)
+        # large sentinel distance (means "no geometry recorded yet")
+        self.grid_mean_distance.fill(1e9)
 
         # Light source list for importance sampling (populated from Python)
         self.max_light_sources = 64
@@ -275,12 +285,38 @@ class Camera:
             self.depth_buffer[px, py] = hit.record.t
             # Check if this is a light source
             mat_idx = world.materials.mat_index[hit.record.id]
+
+            # ensure grid_color is always defined for Taichi static analysis
+            grid_color = vec3(0.0)
             if mat_idx == world.materials.DIFFUSE_LIGHT:
                 # Direct light emission
                 color = world.materials.albedo[hit.record.id]
             else:
                 # Sample irradiance grid for non-light sources (use surface normal)
-                color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
+                # Perform distance mismatch check to avoid light-leaking from other side of occluders
+                local = hit.record.p - self.grid_origin
+                fx = local[0] / self.grid_cell_size
+                fy = local[1] / self.grid_cell_size
+                fz = local[2] / self.grid_cell_size
+                ix0 = int(ti.floor(fx))
+                iy0 = int(ti.floor(fy))
+                iz0 = int(ti.floor(fz))
+
+                if ix0 < 0 or ix0 >= self.grid_res[0] or iy0 < 0 or iy0 >= self.grid_res[1] or iz0 < 0 or iz0 >= self.grid_res[2]:
+                    color = world.materials.albedo[hit.record.id]
+                else:
+                    # compute distance from surface point to the nearest cell center
+                    cell_center = self.grid_origin + vec3((ix0 + 0.5) * self.grid_cell_size,
+                                                         (iy0 + 0.5) * self.grid_cell_size,
+                                                         (iz0 + 0.5) * self.grid_cell_size)
+                    actual_dist = (hit.record.p - cell_center).norm()
+                    mean_d = self.grid_mean_distance[ix0, iy0, iz0]
+                    # if no geometry recorded (large sentinel) allow grid; otherwise compare
+                    if mean_d > 1e8 or abs(actual_dist - mean_d) <= cfg.DISTANCE_MISMATCH_THRESHOLD * self.grid_cell_size:
+                        color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
+                    else:
+                        # mismatch -> likely occluded; fallback to material albedo
+                        color = world.materials.albedo[hit.record.id]
         else:
             color = self.get_background_color(ray.direction)
             self.normal_buffer[px, py] = vec3(0.0, 0.0, 0.0)
@@ -289,7 +325,7 @@ class Camera:
 
     # === 混合模式（自适应） ===
     @ti.func
-    def get_ray_color_hybrid(self, ray: Ray, world: ti.template(), px: ti.i32, py: ti.i32) -> vec3:
+    def get_ray_color_hybrid(self, ray: Ray, world: ti.template(), px: ti.i32, py: ti.i32):
         color = vec3(0.0, 0.0, 0.0)
         hit = world.hit_world(ray, 0.001, tm.inf)
 
@@ -298,6 +334,8 @@ class Camera:
             self.normal_buffer[px, py] = hit.record.normal
             self.depth_buffer[px, py] = hit.record.t
             mat_idx = world.materials.mat_index[hit.record.id]
+            # Ensure grid_color exists for all branches
+            grid_color = vec3(0.0)
 
             # Handle light sources directly
             if mat_idx == world.materials.DIFFUSE_LIGHT:
@@ -305,7 +343,26 @@ class Camera:
                 color = world.materials.albedo[hit.record.id]
             else:
                 # Sample grid for ambient term or primary color
-                grid_color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
+                # Distance-mismatch check to avoid using grid values coming from a different visible side
+                local_g = hit.record.p - self.grid_origin
+                gfx = local_g[0] / self.grid_cell_size
+                gfy = local_g[1] / self.grid_cell_size
+                gfz = local_g[2] / self.grid_cell_size
+                gx = int(ti.floor(gfx))
+                gy = int(ti.floor(gfy))
+                gz = int(ti.floor(gfz))
+                if gx < 0 or gx >= self.grid_res[0] or gy < 0 or gy >= self.grid_res[1] or gz < 0 or gz >= self.grid_res[2]:
+                    grid_color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
+                else:
+                    cell_center = self.grid_origin + vec3((gx + 0.5) * self.grid_cell_size,
+                                                          (gy + 0.5) * self.grid_cell_size,
+                                                          (gz + 0.5) * self.grid_cell_size)
+                    actual_d = (hit.record.p - cell_center).norm()
+                    mean_d = self.grid_mean_distance[gx, gy, gz]
+                    if mean_d > 1e8 or abs(actual_d - mean_d) <= cfg.DISTANCE_MISMATCH_THRESHOLD * self.grid_cell_size:
+                        grid_color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
+                    else:
+                        grid_color = vec3(0.0)
 
                 # Direct illumination: cast shadow rays to each emissive entity
                 direct = vec3(0.0)
@@ -359,7 +416,30 @@ class Camera:
                                 current_hit_record = bounce_hit.record
                                 # If the bounce hits a diffuse surface, sample grid and terminate
                                 if world.materials.mat_index[bounce_hit.record.id] == world.materials.LAMBERT:
-                                    bounced_color = attenuation * self.sample_irradiance_grid(bounce_hit.record.p, world, bounce_hit.record.id, bounce_hit.record.normal)
+                                    # distance mismatch check for bounce-hit before using grid
+                                    local_b = bounce_hit.record.p - self.grid_origin
+                                    bfx = local_b[0] / self.grid_cell_size
+                                    bfy = local_b[1] / self.grid_cell_size
+                                    bfz = local_b[2] / self.grid_cell_size
+                                    bix = int(ti.floor(bfx))
+                                    biy = int(ti.floor(bfy))
+                                    biz = int(ti.floor(bfz))
+                                    use_grid = True
+                                    if bix < 0 or bix >= self.grid_res[0] or biy < 0 or biy >= self.grid_res[1] or biz < 0 or biz >= self.grid_res[2]:
+                                        use_grid = True
+                                    else:
+                                        cell_center_b = self.grid_origin + vec3((bix + 0.5) * self.grid_cell_size,
+                                                                                (biy + 0.5) * self.grid_cell_size,
+                                                                                (biz + 0.5) * self.grid_cell_size)
+                                        actual_db = (bounce_hit.record.p - cell_center_b).norm()
+                                        mean_db = self.grid_mean_distance[bix, biy, biz]
+                                        if mean_db <= 1e8 and abs(actual_db - mean_db) > cfg.DISTANCE_MISMATCH_THRESHOLD * self.grid_cell_size:
+                                            use_grid = False
+
+                                    if use_grid:
+                                        bounced_color = attenuation * self.sample_irradiance_grid(bounce_hit.record.p, world, bounce_hit.record.id, bounce_hit.record.normal)
+                                    else:
+                                        bounced_color = attenuation * world.materials.albedo[bounce_hit.record.id]
                                     break
                             else:
                                 # Ray escaped to background
@@ -434,14 +514,26 @@ class Camera:
                 pos = self.grid_origin + vec3((i + 0.5) * self.grid_cell_size,
                                              (j + 0.5) * self.grid_cell_size,
                                              (k + 0.5) * self.grid_cell_size)
-                # multiple probes per update for higher-quality estimates
+                # variance-guided number of probes per update (per-cell)
+                # compute dynamic samples: base * (1 + variance * scale), clamped to MAX_PROBE_SAMPLES
+                samples_f = float(self.grid_samples_per_update) * (1.0 + self.irradiance_variance[i, j, k] * cfg.VARIANCE_SAMPLING_SCALE)
+                samples = int(ti.min(samples_f, float(cfg.MAX_PROBE_SAMPLES)))
+                if samples <= 0:
+                    samples = 1
+
                 acc_col = vec3(0.0)
-                for s in range(ti.static(self.grid_samples_per_update)):
-                    # 50% of probes: random hemisphere/sample; 50%: direct toward a sampled light bbox (NEE)
+                # accumulate distances for mean_distance update
+                sum_dist = 0.0
+                hit_count = 0
+                for s in range(ti.static(cfg.MAX_PROBE_SAMPLES)):
+                    if s >= samples:
+                        # skip remaining static iterations
+                        continue
+                    # 70% of probes: direct toward a sampled light bbox (NEE); 30%: random hemisphere/sample
                     # preinitialize direction to avoid uninitialized-variable paths
                     d = vec3(0.0)
                     use_light = False
-                    if ti.random(ti.f32) < 0.5 and self.light_count[None] > 0:
+                    if ti.random(ti.f32) < 0.7 and self.light_count[None] > 0:
                         use_light = True
 
                     if use_light:
@@ -449,11 +541,9 @@ class Camera:
                         li = int(ti.floor(ti.random(ti.f32) * self.light_count[None]))
                         lc = self.light_centers[li]
                         lr = self.light_radii[li]
-                        # sample a point inside the light's bounding box (approximate importance)
-                        rx = (ti.random(ti.f32) * 2.0 - 1.0) * lr
-                        ry = (ti.random(ti.f32) * 2.0 - 1.0) * lr
-                        rz = (ti.random(ti.f32) * 2.0 - 1.0) * lr
-                        target = vec3(lc[0] + rx, lc[1] + ry, lc[2] + rz)
+                        # sample a point uniformly on the light sphere surface (better for small spherical lights)
+                        # target = center + radius * unit_direction
+                        target = vec3(lc[0], lc[1], lc[2]) + lr * utils.random_unit_vector()
                         dir_vec = target - pos
                         dist2 = dir_vec.dot(dir_vec)
                         if dist2 < 1e-12:
@@ -468,6 +558,7 @@ class Camera:
                     # probe with limited depth
                     cur_ray = r
                     att = vec3(1.0)
+                    sample_dist = 1e9
                     for depth in range(ti.static(self.grid_probe_depth)):
                         hit = world.hit_world(cur_ray, 0.001, tm.inf)
                         if hit.did_hit:
@@ -486,19 +577,40 @@ class Camera:
                                     col = att * emitted * cfg.LIGHT_IMPORTANCE_SCALE
                                 else:
                                     col = att * emitted
+                                # record distance from probe pos to hit point
+                                diff = hit.record.p - pos
+                                sample_dist = tm.sqrt(diff.dot(diff))
+                                hit_count += 1
                                 break
                         else:
                             # environment
                             env = self.get_background_color(cur_ray.direction)
                             col = att * env
+                            sample_dist = 1e9
                             break
                     acc_col += col
+                    sum_dist += sample_dist
 
-                new_col = acc_col / float(self.grid_samples_per_update)
+                # average over performed samples
+                new_col = acc_col / float(samples)
                 # exponential smoothing with alpha
                 old = self.irradiance_grid[i, j, k]
                 a = self.grid_update_alpha
                 self.irradiance_grid[i, j, k] = old * (1.0 - a) + new_col * a
+                # update luminance mean & variance (exponential moving)
+                lum_new = 0.2126 * new_col[0] + 0.7152 * new_col[1] + 0.0722 * new_col[2]
+                old_lum = self.irradiance_mean_lum[i, j, k]
+                old_var = self.irradiance_variance[i, j, k]
+                delta = lum_new - old_lum
+                self.irradiance_mean_lum[i, j, k] = old_lum * (1.0 - a) + lum_new * a
+                self.irradiance_variance[i, j, k] = old_var * (1.0 - a) + (delta * delta) * a
+
+                # update mean distance (use average of distances recorded this update)
+                avg_dist = 1e9
+                if hit_count > 0:
+                    avg_dist = sum_dist / float(hit_count)
+                oldd = self.grid_mean_distance[i, j, k]
+                self.grid_mean_distance[i, j, k] = oldd * (1.0 - a) + avg_dist * a
 
     @ti.kernel
     def boost_weights_region(self, cx: vec3, influence: float, multiplier: float):

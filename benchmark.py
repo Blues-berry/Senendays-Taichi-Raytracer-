@@ -248,7 +248,7 @@ def run_benchmark(scene_mode='cornell_box'):
         gui.text(f"Data: {len(benchmark_data)} records", (0.05, 0.75))
         
         gui.show()
-
+ 
         # Update adaptive sampling weights for next frame
         import experiment_config as cfg
         cam.compute_adaptive_weights(cfg.ADAPTIVE_BRIGHTNESS_THRESHOLD,

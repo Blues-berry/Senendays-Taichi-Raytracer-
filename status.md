@@ -1,15 +1,27 @@
-运行结果: 基准运行成功并完成（见终端日志）。输出目录： benchmark_results_20251226_172131，包含 benchmark_results.csv 和若干截图（例如 result_hybrid.png、after_displacement_*）。
+引入重要性采样 (Next Event Estimation, NEE)
+现状分析：目前网格点的更新（update_grid）可能是随机射向半球方向。如果场景中有像 DiffuseLight 这样的小光源，随机采样很难击中它，导致网格收敛极慢，画面偏暗。
 
-已实现:
+改进方案： 在 update_grid 的采样逻辑中，强制让一部分光线直接射向光源物体。
 
-G-Buffer：在 camera.py 增加 normal_buffer 与 depth_buffer 并在命中时写入。
-A-SVGF：实现轻量级 asvgf_filter()（3x3 法线/深度/亮度引导滤波）并在 Hybrid 后调用。
-自适应采样：加入 adaptive_weight_map 与内核 compute_adaptive_weights(...)；在 experiment_config.py 添加参数 ADAPTIVE_BRIGHTNESS_THRESHOLD、ADAPTIVE_SAMPLING_MULTIPLIER、ADAPTIVE_MAX_MULTIPLIER。
-调整了网格更新（更多探针、指数平滑）与将模糊开关驱动自 experiment_config.py。
-关键文件: camera.py, experiment_config.py, main.py, benchmark.py
+操作：在 camera.py 内部维护一个光源列表，更新网格时，50% 的射线随机发射，50% 的射线直接指向光源采样。
 
-下一步建议（选一）:
+效果：解决间接光照不足的问题，显著提升场景亮度一致性，让 Hybrid 结果在色调上更接近 PT。增强光源权重
 
-我现在打开并预览 benchmark_results.csv；或
-我列出并展示几张 hybrid / after_displacement 的截图以比较滤波前后差异；或
-我帮你微调参数（例如调整 ADAPTIVE_BRIGHTNESS_THRESHOLD、ADAPTIVE_SAMPLING_MULTIPLIER、grid_samples_per_update、grid_probe_depth、grid_update_alpha）并再跑一次短时测试。
+“在 update_grid 内实现重要性采样。检测场景中 Materials.EMISSIVE 材质的物体，在 Probe 发射探测光线时，引导光线朝向这些物体的包围盒方向。”
+
+改进自适应权重：基于方差的更新 (Variance-guided Update)
+现状分析：experiment_config.py 中虽然有 ADAPTIVE_BOOST_MULTIPLIER，但它可能主要基于物体位置。
+
+改进方案： 为每个网格单元（Probe）增加一个 variance 字段。
+
+逻辑：记录连续几帧内该网格点颜色值的变化量。如果变化剧烈（说明光影不稳定），则在该区域分配更多的 samples_per_probe。
+
+效果：将算力集中在“阴影边缘”和“光影交界处”，而不是浪费在已经收敛的平坦区域。
+解决“漏光” (Light Leaking) 与遮挡判定
+现状分析：Grid 算法最常见的问题是光照穿墙。
+
+改进方案： 在网格中除了存储 RGB 颜色，额外存储一个 mean_distance（平均距离）。
+
+判定：在采样时，对比“当前像素点到网格点的距离”与“网格点存储的平均距离”。如果两者不匹配，说明中间隔着墙，应当舍弃该网格点的贡献。
+
+效果：消除物体背面不自然的漏光，增强接触阴影（Contact Shadows）的质量。

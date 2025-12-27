@@ -36,6 +36,12 @@ ADAPTIVE_MAX_MULTIPLIER = 2.0             # Cap multiplier (so weight <= 1 + thi
 
 # Importance sampling / NEE
 LIGHT_IMPORTANCE_SCALE = 2.0              # Scale applied to emissive hits during grid probing
+# Variance-guided sampling
+VARIANCE_SAMPLING_SCALE = 2.0             # Multiplier for converting variance -> extra probe samples
+MAX_PROBE_SAMPLES = 16                    # Upper bound for per-cell probe samples
+
+# Distance-based leak prevention
+DISTANCE_MISMATCH_THRESHOLD = 1.0         # Threshold (in multiples of cell size) to detect mismatch
 
 # Output Settings
 OUTPUT_DIRECTORY = "experiment_results"

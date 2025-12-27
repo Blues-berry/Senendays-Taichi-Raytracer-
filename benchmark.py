@@ -8,12 +8,41 @@ import main
 from main import spheres, cam, world
 import utils
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+# --- Experiment groups for ablation study ---
+# Baseline: interpolation OFF, light-guided probe sampling OFF
+# Optimized_V1: interpolation ON, light-guided probe sampling OFF
+# Full_Hybrid: interpolation ON, light-guided probe sampling ON
+EXPERIMENT_GROUPS = [
+    {
+        "name": "Baseline",
+        "interpolate": False,
+        "light_guided": False,
+    },
+    {
+        "name": "Optimized_V1",
+        "interpolate": True,
+        "light_guided": False,
+    },
+    {
+        "name": "Full_Hybrid",
+        "interpolate": True,
+        "light_guided": True,
+    },
+]
+
 # Note: `main` already initializes Taichi when imported, avoid re-initializing here.
 
 # Rendering modes
 RENDER_MODE_PT = 0      # Path Tracing (Ground Truth)
 RENDER_MODE_GRID = 1    # Pure Grid
 RENDER_MODE_HYBRID = 2  # Hybrid Adaptive
+
+# Only compare groups in HYBRID render mode (keeps runtime manageable)
+COMPARE_RENDER_MODE = RENDER_MODE_HYBRID
 
 # Create results directory and timestamped output subdirectory
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -52,13 +81,13 @@ def calculate_accurate_mse(current_linear, reference_linear):
     # Ensure both are numpy arrays of type float32
     curr_f = current_linear.astype(np.float32)
     ref_f = reference_linear.astype(np.float32)
-    
+
     # Normalize to [0, 1] range if needed
     if curr_f.max() > 1.1:
         curr_f = curr_f / 255.0
     if ref_f.max() > 1.1:
         ref_f = ref_f / 255.0
-    
+
     # Calculate MSE in linear space
     mse = np.mean((curr_f - ref_f) ** 2)
     return float(mse)
@@ -76,16 +105,130 @@ def save_benchmark_results():
     else:
         log_message("No remaining data to save")
 
+
+def plot_mse_curves(mse_by_group, out_path, title):
+    """Plot multiple MSE curves (one per group) on the same figure."""
+    plt.figure(figsize=(10, 5))
+    for group_name, series in mse_by_group.items():
+        if len(series) == 0:
+            continue
+        xs = [p[0] for p in series]
+        ys = [p[1] for p in series]
+        plt.plot(xs, ys, label=group_name, linewidth=1.5)
+    plt.xlabel('Frame (since start of group run)')
+    plt.ylabel('MSE vs PT (linear)')
+    plt.title(title)
+    plt.yscale('log')
+    plt.grid(True, which='both', linestyle='--', alpha=0.35)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+
+
+def run_group_experiments(scene_mode='cornell_box'):
+    """Run 3 experiment groups and output a single plot with 3 MSE curves."""
+    global frame_count, current_mode_frames, pt_reference, pt_reference_linear, world, cam, spheres, materials
+
+    mse_by_group = {g['name']: [] for g in EXPERIMENT_GROUPS}
+
+    for gi, g in enumerate(EXPERIMENT_GROUPS):
+        log_message(f"\n=== Running group {gi+1}/{len(EXPERIMENT_GROUPS)}: {g['name']} ===")
+
+        # Re-init scene for fairness (same camera/world setup)
+        world, cam = main.setup_scene(scene_mode)
+        cam.scene_mode = scene_mode
+
+        # Apply feature toggles on camera
+        cam.interpolate_grid_sampling = bool(g['interpolate'])
+        cam.enable_light_guided_probes = bool(g['light_guided'])
+
+        # Ensure the compact light list exists when light-guided is enabled
+        # (setup_scene usually calls set_light_sources; calling again is safe)
+        try:
+            cam.set_light_sources(spheres, materials)
+        except Exception:
+            # If the scene builder doesn't expose materials list in this benchmark context
+            pass
+
+        # Reset counters and references
+        frame_count = 0
+        current_mode_frames = 0
+        pt_reference = None
+        pt_reference_linear = None
+        current_frame.fill(0.001)
+
+        # (Re)adapt grid once
+        cam.adapt_grid_to_scene(spheres, verbose=False)
+
+        # Warm-up
+        ti.sync()
+        cam.update_grid(world, 0.01)
+        cam.render(world, COMPARE_RENDER_MODE)
+        if COMPARE_RENDER_MODE == RENDER_MODE_HYBRID:
+            cam.asvgf_filter()
+        ti.sync()
+
+        # Capture PT reference for this group (short PT run)
+        # Keep it short to avoid tripling runtime too much.
+        pt_ref_spp_frames = 150
+        pt_accum = np.zeros((*cam.img_res, 3), dtype=np.float32)
+        for f in range(pt_ref_spp_frames):
+            cam.render_pt(world)
+            ti.sync()
+            pt_accum += cam.pt_frame.to_numpy().astype(np.float32)
+        pt_reference_linear = pt_accum / float(pt_ref_spp_frames)
+
+        # Now run the tested method and record MSE per frame
+        test_frames = 450
+        for f in range(test_frames):
+            if COMPARE_RENDER_MODE in (RENDER_MODE_GRID, RENDER_MODE_HYBRID):
+                cam.update_grid(world, 0.01)
+            cam.render(world, COMPARE_RENDER_MODE)
+            if COMPARE_RENDER_MODE == RENDER_MODE_HYBRID:
+                cam.asvgf_filter()
+            ti.sync()
+
+            current_linear = cam.frame.to_numpy()
+            mse = calculate_accurate_mse(current_linear, pt_reference_linear)
+            mse_by_group[g['name']].append((f, mse))
+
+            # Keep GUI responsive if needed
+            if gui.running:
+                weight = 1.0 / (f + 1)
+                average_frames(current_frame, cam.frame, weight)
+                gui.set_image(current_frame)
+                gui.text(f"Group: {g['name']}", (0.05, 0.95))
+                gui.text(f"Mode: {get_mode_name(COMPARE_RENDER_MODE)}", (0.05, 0.90))
+                gui.text(f"Frame: {f+1}/{test_frames}", (0.05, 0.85))
+                gui.text(f"MSE: {mse:.6e}", (0.05, 0.80))
+                gui.show()
+
+        # Save a result screenshot per group
+        out_img = f"result_{g['name']}.png"
+        save_screenshot(gui, out_img)
+
+    # Plot combined curves
+    plot_path = os.path.join(output_dir, 'mse_curves_groups.png')
+    plot_mse_curves(
+        mse_by_group,
+        plot_path,
+        title=f"MSE Curves (mode={get_mode_name(COMPARE_RENDER_MODE)}) - {scene_mode}",
+    )
+    log_message(f"Saved MSE plot: {plot_path}")
+
+    return mse_by_group
+
 def switch_mode(new_mode):
     """Switch to a new rendering mode"""
     global render_mode, current_mode_frames, mode_start_time
     render_mode = new_mode
     current_mode_frames = 0
     mode_start_time = time.time()
-    
+
     # Clear the frame when switching modes
     current_frame.fill(0)
-    
+
     mode_names = {
         RENDER_MODE_PT: "Path Tracing",
         RENDER_MODE_GRID: "Pure Grid",
@@ -110,24 +253,24 @@ def run_benchmark(scene_mode='cornell_box'):
 
     # 设置场景模式到相机对象
     cam.scene_mode = scene_mode
-    
+
     mode_frames = 450  # Number of frames to run per mode
     modes = [RENDER_MODE_PT, RENDER_MODE_GRID, RENDER_MODE_HYBRID]
     current_mode_idx = 0
-    
+
     # Track if displacement has occurred in current mode
     displacement_occurred = False
     displacement_frame_in_mode = -1  # Track frames after displacement
-    
+
     # Grid 初始化（setup_scene 内已经 adapt 过，这里保持一次以防后续逻辑依赖）
     cam.adapt_grid_to_scene(spheres, verbose=True)
     log_message(f"Grid initialized for benchmark (scene={scene_mode})")
-    
+
     # Initialize current_frame with a small value to avoid pure black
     current_frame.fill(0.001)
-    
+
     switch_mode(modes[current_mode_idx])
-    
+
     # Do a warm-up render to initialize everything
     ti.sync()
     if render_mode == RENDER_MODE_GRID or render_mode == RENDER_MODE_HYBRID:
@@ -135,25 +278,25 @@ def run_benchmark(scene_mode='cornell_box'):
     cam.render(world, render_mode)
     ti.sync()
     log_message("Warm-up render completed")
-    
+
     # Add timing validation
     last_frame_time = time.perf_counter()
-    
+
     # Main rendering loop
     while gui.running and current_mode_idx < len(modes):
         # Handle key events
         if gui.get_event(ti.GUI.PRESS):
             if gui.event.key == ti.GUI.ESCAPE:
                 break
-        
+
         # Render frame with proper GPU synchronization timing
         current_time = time.perf_counter()
         expected_gap = current_time - last_frame_time
-        
+
         # Force synchronization before timing to ensure accurate measurement
         ti.sync()
         start_time = time.perf_counter()
-        
+
         # Select rendering method based on current mode
         # Use existing render method: mode 0=PT, 1=Grid, 2=Hybrid
         if render_mode == RENDER_MODE_PT:
@@ -169,58 +312,58 @@ def run_benchmark(scene_mode='cornell_box'):
             cam.render(world, render_mode)
             # Apply lightweight A-SVGF denoiser to hybrid output
             cam.asvgf_filter()
-        
+
         # Force synchronization after rendering to ensure completion
         ti.sync()
         frame_time = time.perf_counter() - start_time
-        
+
         # Debug: log detailed timing for first few frames
         if frame_count < 5:
             log_message(f"Frame {frame_count}: expected_gap={expected_gap:.6f}s, render_time={frame_time:.6f}s")
-        
+
         # Use the actual render time for FPS calculation
         fps = 1.0 / frame_time if frame_time > 0.001 else 0  # More reasonable threshold
-        
+
         # Apply mode-specific FPS caps to filter outliers
         max_fps = {
             RENDER_MODE_PT: 200,     # Path Tracing is slow
             RENDER_MODE_GRID: 2000,  # Grid method is fast
             RENDER_MODE_HYBRID: 500   # Hybrid is medium
         }
-        
+
         if fps > max_fps.get(render_mode, 500):
             old_fps = fps
             fps = 0.0
             if frame_count < 10:  # Only log first few warnings
                 log_message(f"FPS capped: {old_fps:.1f} -> 0.0 (max for {get_mode_name(render_mode)}: {max_fps.get(render_mode, 500)})")
-        
+
         # Update last frame time
         last_frame_time = current_time
-        
+
         # Update frame buffer with progressive rendering
         weight = 1.0 / (current_mode_frames + 1)
         average_frames(current_frame, cam.frame, weight)
-        
+
         # Debug: check frame content for first few frames
         if frame_count < 3:
             frame_min = float(current_frame.to_numpy().min())
             frame_max = float(current_frame.to_numpy().max())
             log_message(f"Frame {frame_count} content: min={frame_min:.6f}, max={frame_max:.6f}")
-        
+
         # Store PT reference for MSE calculation (at frame 149, before displacement at frame 150)
         if render_mode == RENDER_MODE_PT and current_mode_frames == 149:
             # Store both gamma and linear space versions
             pt_reference = current_frame.to_numpy()  # Gamma space for display compatibility
             pt_reference_linear = cam.frame.to_numpy()  # Linear space for accurate MSE
             log_message("PT reference frame stored for MSE comparison")
-        
+
         # Calculate MSE if we have a PT reference and we're not in PT mode
         mse = 0.0
         if pt_reference_linear is not None and render_mode != RENDER_MODE_PT:
             # Use linear space frames for accurate MSE calculation
             current_linear = cam.frame.to_numpy()  # Current linear frame
             mse = calculate_accurate_mse(current_linear, pt_reference_linear)
-        
+
         # Update benchmark data
         benchmark_data.append([
             frame_count,
@@ -229,14 +372,14 @@ def run_benchmark(scene_mode='cornell_box'):
             mse,
             datetime.now().isoformat()
         ])
-        
+
         # Flush data to file every 10 frames to prevent data loss
         if len(benchmark_data) >= 10:
             flush_benchmark_data()
-        
+
         # Display
         gui.set_image(current_frame)
-        
+
         # Display stats
         gui.text(f"Mode: {get_mode_name(render_mode)}", (0.05, 0.95))
         gui.text(f"FPS: {fps:.1f}", (0.05, 0.90))
@@ -246,15 +389,15 @@ def run_benchmark(scene_mode='cornell_box'):
             gui.text("MSE vs PT: N/A (Reference)", (0.05, 0.85))
         gui.text(f"Frame: {current_mode_frames + 1}/{mode_frames}", (0.05, 0.80))
         gui.text(f"Data: {len(benchmark_data)} records", (0.05, 0.75))
-        
+
         gui.show()
- 
+
         # Update adaptive sampling weights for next frame
         import experiment_config as cfg
         cam.compute_adaptive_weights(cfg.ADAPTIVE_BRIGHTNESS_THRESHOLD,
                          cfg.ADAPTIVE_SAMPLING_MULTIPLIER,
                          cfg.ADAPTIVE_MAX_MULTIPLIER)
-        
+
         # Dynamic displacement trigger: at frame 150, move the light source (only once per mode)
         if current_mode_frames == 150 and not displacement_occurred and len(spheres) > 0:
             log_message(f"DISPLACEMENT TRIGGERED - Total frames: {frame_count}, Mode frames: {current_mode_frames}")
@@ -294,21 +437,21 @@ def run_benchmark(scene_mode='cornell_box'):
         current_mode_frames += 1
         if displacement_occurred and displacement_frame_in_mode >= 0:
             displacement_frame_in_mode += 1
-        
+
         # Save screenshot at specified frames: 5, 50, 100 (before displacement), then after displacement: 200, 250, 300, 350, 400, 450
         screenshot_frames = [5, 50, 100, 200, 250, 300, 350, 400, 450]
         if current_mode_frames in screenshot_frames:
             mode_name = get_mode_name(render_mode).lower().replace(" ", "_")
             filename = f"{mode_name}_frame_{current_mode_frames}.png"
             save_screenshot(gui, filename)
-        
+
         # Save screenshot at the last frame of each mode
         if current_mode_frames == mode_frames:
             log_message(f"MODE COMPLETE - Total frames: {frame_count}, Mode frames: {current_mode_frames}")
             # Save screenshot
             mode_name = get_mode_name(render_mode).lower().replace(" ", "_")
             save_screenshot(gui, f"result_{mode_name}.png")
-            
+
             # Switch to next mode
             current_mode_idx += 1
             if current_mode_idx < len(modes):
@@ -362,7 +505,8 @@ def flush_benchmark_data():
 if __name__ == "__main__":
     log_message("Starting benchmark...")
     try:
-        run_benchmark()
+        # New: 3-group ablation study (Baseline / Optimized_V1 / Full_Hybrid)
+        run_group_experiments('cornell_box')
     except KeyboardInterrupt:
         log_message("Benchmark interrupted by user")
         flush_benchmark_data()

@@ -136,6 +136,12 @@ class Camera:
         self.light_radii = ti.field(dtype=ti.f32, shape=self.max_light_sources)
         self.light_count[None] = 0
 
+# Feature toggles (controlled by benchmark experiments)
+        # - interpolate_grid_sampling: trilinear (8-probe) sampling vs nearest-probe sampling
+        # - enable_light_guided_probes: occasionally aim probe rays at light sources during grid updates
+        self.interpolate_grid_sampling = True
+        self.enable_light_guided_probes = True
+
     @ti.kernel
     def render(self, world: ti.template(), mode: ti.i32):
         # Main rendering loop, supports adaptive per-pixel sample counts
@@ -191,55 +197,85 @@ class Camera:
 
     @ti.func
     def sample_irradiance_grid(self, p: vec3, world: ti.template(), fallback_id: int, normal: vec3) -> vec3:
+        """Sample the irradiance grid.
+
+        When `self.interpolate_grid_sampling` is True: trilinear interpolation over 8 probes.
+        When False: nearest-probe sampling (baseline).
+        """
         # Map world position to grid-space continuous coordinates
         local = p - self.grid_origin
         fx = local[0] / self.grid_cell_size
         fy = local[1] / self.grid_cell_size
         fz = local[2] / self.grid_cell_size
 
-        # integer base indices
-        ix0 = int(ti.floor(fx))
-        iy0 = int(ti.floor(fy))
-        iz0 = int(ti.floor(fz))
-
-        # fractional part
-        tx = fx - ix0
-        ty = fy - iy0
-        tz = fz - iz0
-
-        # clamp base indices so ix1 = ix0+1 is valid
         nx = self.grid_res[0]
         ny = self.grid_res[1]
         nz = self.grid_res[2]
+
         color = vec3(0.0)
-        if ix0 < 0 or ix0 >= nx - 1 or iy0 < 0 or iy0 >= ny - 1 or iz0 < 0 or iz0 >= nz - 1:
-            # Outside or on the border: fallback to material albedo
-            color = world.materials.albedo[fallback_id]
+
+        if self.interpolate_grid_sampling:
+            # integer base indices (cell corner)
+            ix0f = ti.floor(fx)
+            iy0f = ti.floor(fy)
+            iz0f = ti.floor(fz)
+            ix0 = int(ix0f)
+            iy0 = int(iy0f)
+            iz0 = int(iz0f)
+
+            # fractional offset inside the cell
+            tx = fx - ix0f
+            ty = fy - iy0f
+            tz = fz - iz0f
+
+            # Default fallback (outside grid / border)
+            if ix0 < 0 or ix0 >= nx - 1 or iy0 < 0 or iy0 >= ny - 1 or iz0 < 0 or iz0 >= nz - 1:
+                color = world.materials.albedo[fallback_id]
+            else:
+                ix1 = ix0 + 1
+                iy1 = iy0 + 1
+                iz1 = iz0 + 1
+
+                # fetch 8 neighbors
+                c000 = self.irradiance_grid[ix0, iy0, iz0]
+                c100 = self.irradiance_grid[ix1, iy0, iz0]
+                c010 = self.irradiance_grid[ix0, iy1, iz0]
+                c110 = self.irradiance_grid[ix1, iy1, iz0]
+                c001 = self.irradiance_grid[ix0, iy0, iz1]
+                c101 = self.irradiance_grid[ix1, iy0, iz1]
+                c011 = self.irradiance_grid[ix0, iy1, iz1]
+                c111 = self.irradiance_grid[ix1, iy1, iz1]
+
+                # linear weights (explicit 8-corner blend)
+                w000 = (1.0 - tx) * (1.0 - ty) * (1.0 - tz)
+                w100 = tx * (1.0 - ty) * (1.0 - tz)
+                w010 = (1.0 - tx) * ty * (1.0 - tz)
+                w110 = tx * ty * (1.0 - tz)
+                w001 = (1.0 - tx) * (1.0 - ty) * tz
+                w101 = tx * (1.0 - ty) * tz
+                w011 = (1.0 - tx) * ty * tz
+                w111 = tx * ty * tz
+
+                color = (
+                    c000 * w000
+                    + c100 * w100
+                    + c010 * w010
+                    + c110 * w110
+                    + c001 * w001
+                    + c101 * w101
+                    + c011 * w011
+                    + c111 * w111
+                )
         else:
-            ix1 = ix0 + 1
-            iy1 = iy0 + 1
-            iz1 = iz0 + 1
+            # Baseline: nearest-probe sampling
+            ix = int(ti.floor(fx + 0.5))
+            iy = int(ti.floor(fy + 0.5))
+            iz = int(ti.floor(fz + 0.5))
+            if ix < 0 or ix >= nx or iy < 0 or iy >= ny or iz < 0 or iz >= nz:
+                color = world.materials.albedo[fallback_id]
+            else:
+                color = self.irradiance_grid[ix, iy, iz]
 
-            # fetch the 8 neighbors for standard trilinear interpolation
-            c000 = self.irradiance_grid[ix0, iy0, iz0]
-            c100 = self.irradiance_grid[ix1, iy0, iz0]
-            c010 = self.irradiance_grid[ix0, iy1, iz0]
-            c110 = self.irradiance_grid[ix1, iy1, iz0]
-            c001 = self.irradiance_grid[ix0, iy0, iz1]
-            c101 = self.irradiance_grid[ix1, iy0, iz1]
-            c011 = self.irradiance_grid[ix0, iy1, iz1]
-            c111 = self.irradiance_grid[ix1, iy1, iz1]
-
-            # standard trilinear interpolation
-            c00 = c000 * (1.0 - tx) + c100 * tx
-            c10 = c010 * (1.0 - tx) + c110 * tx
-            c01 = c001 * (1.0 - tx) + c101 * tx
-            c11 = c011 * (1.0 - tx) + c111 * tx
-
-            c0 = c00 * (1.0 - ty) + c10 * ty
-            c1 = c01 * (1.0 - ty) + c11 * ty
-
-            color = c0 * (1.0 - tz) + c1 * tz
         return color
 
     # === Path Tracing (Ground-Truth) ===
@@ -529,20 +565,24 @@ class Camera:
                     if s >= samples:
                         # skip remaining static iterations
                         continue
-                    # 70% of probes: direct toward a sampled light bbox (NEE); 30%: random hemisphere/sample
-                    # preinitialize direction to avoid uninitialized-variable paths
+                    # Half of BASE_UPDATE_PROBABILITY: explicitly shoot rays toward emissive objects.
+                    # Otherwise, keep purely-random probing.
                     d = vec3(0.0)
+
                     use_light = False
-                    if ti.random(ti.f32) < 0.7 and self.light_count[None] > 0:
-                        use_light = True
+                    if self.enable_light_guided_probes and self.light_count[None] > 0:
+                        # desired probability = base_prob/2
+                        light_prob = base_prob * 0.5
+                        if ti.random(ti.f32) < light_prob:
+                            use_light = True
 
                     if use_light:
-                        # pick a random light from the list
+                        # pick a random light from the compact list
                         li = int(ti.floor(ti.random(ti.f32) * self.light_count[None]))
                         lc = self.light_centers[li]
                         lr = self.light_radii[li]
-                        # sample a point uniformly on the light sphere surface (better for small spherical lights)
-                        # target = center + radius * unit_direction
+
+                        # sample a target point on the light sphere surface
                         target = vec3(lc[0], lc[1], lc[2]) + lr * utils.random_unit_vector()
                         dir_vec = target - pos
                         dist2 = dir_vec.dot(dir_vec)
@@ -551,6 +591,7 @@ class Camera:
                         else:
                             d = dir_vec / tm.sqrt(dist2)
                     else:
+                        # purely random probe direction
                         d = utils.random_unit_vector()
 
                     r = self.make_ray(pos, d)

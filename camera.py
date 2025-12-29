@@ -87,8 +87,14 @@ class Camera:
         self.defocus_disk_v = v * defocus_radius
 
         self.frame = ti.Vector.field(n=3, dtype=ti.f32, shape=self.img_res)
-        # store a PT baseline frame for MSE comparisons
+        # store a PT reference frame for MSE/heatmap comparisons
+        # - pt_frame: current reference (typically averaged over N spp)
+        # - pt_accum: running sum accumulator to build a high-spp reference
         self.pt_frame = ti.Vector.field(n=3, dtype=ti.f32, shape=self.img_res)
+        self.pt_accum = ti.Vector.field(n=3, dtype=ti.f32, shape=self.img_res)
+        self.pt_spp_count = ti.field(dtype=ti.i32, shape=())
+        self.pt_spp_count[None] = 0
+        self.pt_accum.fill(0.0)
         # accumulator for MSE kernel
         self._mse_acc = ti.field(dtype=ti.f32, shape=())
 
@@ -97,6 +103,20 @@ class Camera:
         self.depth_buffer = ti.field(dtype=ti.f32, shape=self.img_res)
         # denoised output buffer for A-SVGF
         self.denoised_frame = ti.Vector.field(n=3, dtype=ti.f32, shape=self.img_res)
+
+        # Temporal accumulation (EMA) buffers for reducing noise across frames
+        self.accum_frame = ti.Vector.field(n=3, dtype=ti.f32, shape=self.img_res)
+        # previous-frame G-buffer for motion detection
+        self.prev_normal_buffer = ti.Vector.field(n=3, dtype=ti.f32, shape=self.img_res)
+        self.prev_depth_buffer = ti.field(dtype=ti.f32, shape=self.img_res)
+        # EMA tuning (per-pixel alpha selection)
+        # When pixel is static -> small alpha (strong history). When moving -> large alpha (fast update).
+        self.accum_alpha_static = 0.10
+        self.accum_alpha_moving = 0.80
+        # initialize accumulators
+        self.accum_frame.fill(0.0)
+        self.prev_normal_buffer.fill(0.0)
+        self.prev_depth_buffer.fill(1e9)
 
         # Adaptive sampling weight map (>=1.0). Starts neutral (1.0)
         self.adaptive_weight_map = ti.field(dtype=ti.f32, shape=self.img_res)
@@ -167,11 +187,99 @@ class Camera:
                         acc += self.get_ray_color_hybrid(view_ray, world, x, y)
 
             # Store averaged color
-            self.frame[x, y] = acc / float(local_samples)
+            cur_col = acc / float(local_samples)
+
+            # --- Temporal EMA accumulation per-pixel ---
+            # motion detection using previous G-buffer
+            n_cur = self.normal_buffer[x, y]
+            d_cur = self.depth_buffer[x, y]
+            n_prev = self.prev_normal_buffer[x, y]
+            d_prev = self.prev_depth_buffer[x, y]
+
+            # default assume static
+            alpha = self.accum_alpha_static
+
+            # determine motion: consider depth relative change and normal alignment
+            is_moving = False
+            if d_prev > 1e8 and d_cur > 1e8:
+                is_moving = False
+            else:
+                # relative depth change
+                if d_prev > 1e-6:
+                    depth_rel = d_cur - d_prev
+                    if depth_rel < 0.0:
+                        depth_rel = -depth_rel
+                    depth_rel = depth_rel / d_prev
+                else:
+                    depth_rel = d_cur - d_prev
+                    if depth_rel < 0.0:
+                        depth_rel = -depth_rel
+
+                ndot = n_cur.dot(n_prev)
+                if depth_rel > 0.02 or ndot < 0.98:
+                    is_moving = True
+
+            if is_moving:
+                alpha = self.accum_alpha_moving
+            else:
+                alpha = self.accum_alpha_static
+
+            old = self.accum_frame[x, y]
+            new_acc = old * (1.0 - alpha) + cur_col * alpha
+            self.accum_frame[x, y] = new_acc
+
+            # write out accumulated result and update prev G-buffer for next frame
+            self.frame[x, y] = new_acc
+            self.prev_normal_buffer[x, y] = n_cur
+            self.prev_depth_buffer[x, y] = d_cur
+
+    @ti.kernel
+    def clear_pt_reference(self):
+        # Reset high-spp PT reference accumulation
+        for x, y in self.pt_accum:
+            self.pt_accum[x, y] = vec3(0.0)
+        self.pt_spp_count[None] = 0
+
+    @ti.kernel
+    def accumulate_pt_reference(self, world: ti.template(), spp: ti.i32):
+        """Accumulate `spp` additional PT samples into pt_accum, then update pt_frame.
+
+        This builds a much more stable PT reference for error heatmaps / metrics.
+        """
+        for x, y in self.pt_accum:
+            # accumulate spp samples for this pixel
+            for s in range(spp):
+                self.pt_accum[x, y] += self.get_ray_color_pt(self.get_ray(x, y), world, x, y)
+
+        # update global spp count
+        self.pt_spp_count[None] += spp
+
+        # update averaged reference frame
+        inv = 1.0 / float(self.pt_spp_count[None])
+        for x, y in self.pt_frame:
+            self.pt_frame[x, y] = self.pt_accum[x, y] * inv
+
+    def render_pt_reference(self, world, target_spp: int = 512, chunk_spp: int = 8, reset: bool = True):
+        """Python helper to build a PT reference of `target_spp` samples per pixel.
+
+        Args:
+            target_spp: total spp to accumulate (e.g., 1024)
+            chunk_spp: how many spp to accumulate per kernel call (controls responsiveness)
+            reset: if True, clears previous accumulation first
+        """
+        if reset:
+            self.clear_pt_reference()
+
+        # accumulate in chunks to avoid extremely long single kernel
+        remaining = int(target_spp)
+        while remaining > 0:
+            step = int(chunk_spp) if remaining > int(chunk_spp) else int(remaining)
+            self.accumulate_pt_reference(world, step)
+            remaining -= step
 
     @ti.kernel
     def render_pt(self, world: ti.template()):
-        # Render a single-sample PT baseline into pt_frame
+        # Backward-compatible: single-sample PT into pt_frame (does NOT touch pt_accum)
         for x, y in self.pt_frame:
             self.pt_frame[x, y] = self.get_ray_color_pt(self.get_ray(x, y), world, x, y)
 
@@ -189,6 +297,53 @@ class Camera:
         # normalize
         denom = float(self.img_res[0] * self.img_res[1] * 3)
         return self._mse_acc[None] / denom
+
+    @ti.kernel
+    def render_error_heatmap(self):
+        """Render error heatmap into `self.frame`.
+
+        Error = abs(hybrid - pt_reference). Then map scalar error to a pseudo-color:
+        low error -> cold (blue), high error -> hot (red).
+
+        Notes:
+        - Assumes `self.frame` currently contains the hybrid result (linear).
+        - Assumes `self.pt_frame` contains the PT reference (linear).
+        """
+        for x, y in self.frame:
+            a = self.frame[x, y]
+            b = self.pt_frame[x, y]
+            # L1 error magnitude (mean abs per channel)
+            err = (ti.abs(a[0] - b[0]) + ti.abs(a[1] - b[1]) + ti.abs(a[2] - b[2])) / 3.0
+
+            # Simple blue->cyan->green->yellow->red ramp.
+            # Normalize using a tunable scale (bigger => more blue overall).
+            # This is a visualization; not used for metrics.
+            scale = 0.25
+            t = err / scale
+            if t < 0.0:
+                t = 0.0
+            if t > 1.0:
+                t = 1.0
+
+            c = vec3(0.0)
+            if t < 0.25:
+                # blue -> cyan
+                u = t / 0.25
+                c = vec3(0.0, u, 1.0)
+            elif t < 0.5:
+                # cyan -> green
+                u = (t - 0.25) / 0.25
+                c = vec3(0.0, 1.0, 1.0 - u)
+            elif t < 0.75:
+                # green -> yellow
+                u = (t - 0.5) / 0.25
+                c = vec3(u, 1.0, 0.0)
+            else:
+                # yellow -> red
+                u = (t - 0.75) / 0.25
+                c = vec3(1.0, 1.0 - u, 0.0)
+
+            self.frame[x, y] = c
 
     @ti.func
     def defocus_disk_sample(self):
@@ -256,16 +411,51 @@ class Camera:
                 w011 = (1.0 - tx) * ty * tz
                 w111 = tx * ty * tz
 
-                color = (
-                    c000 * w000
-                    + c100 * w100
-                    + c010 * w010
-                    + c110 * w110
-                    + c001 * w001
-                    + c101 * w101
-                    + c011 * w011
-                    + c111 * w111
-                )
+                # For each of the 8 probe corners, check mean-distance mismatch.
+                # If a probe's recorded mean distance deviates from the actual distance by >20%,
+                # zero its interpolation weight (treat it as occluded).
+                sum_w = 0.0
+
+                # helper: compute cell center and possibly zero weight
+                def probe_contrib(ix, iy, iz, w):
+                    if w <= 0.0:
+                        return vec3(0.0), 0.0
+                    cell_center = self.grid_origin + vec3((ix + 0.5) * self.grid_cell_size,
+                                                         (iy + 0.5) * self.grid_cell_size,
+                                                         (iz + 0.5) * self.grid_cell_size)
+                    actual_d = (p - cell_center).norm()
+                    mean_d = self.grid_mean_distance[ix, iy, iz]
+                    if mean_d > 1e8:
+                        # no recorded geometry -> allow probe
+                        return self.irradiance_grid[ix, iy, iz] * w, w
+                    # avoid division by zero
+                    if mean_d <= 1e-6:
+                        return self.irradiance_grid[ix, iy, iz] * w, w
+                    rel = (actual_d - mean_d)
+                    if rel < 0.0:
+                        rel = -rel
+                    rel = rel / mean_d
+                    if rel > 0.20:
+                        # occluded by depth mismatch -> drop weight
+                        return vec3(0.0), 0.0
+                    else:
+                        return self.irradiance_grid[ix, iy, iz] * w, w
+
+                c0, ww0 = probe_contrib(ix0, iy0, iz0, w000)
+                c1, ww1 = probe_contrib(ix1, iy0, iz0, w100)
+                c2, ww2 = probe_contrib(ix0, iy1, iz0, w010)
+                c3, ww3 = probe_contrib(ix1, iy1, iz0, w110)
+                c4, ww4 = probe_contrib(ix0, iy0, iz1, w001)
+                c5, ww5 = probe_contrib(ix1, iy0, iz1, w101)
+                c6, ww6 = probe_contrib(ix0, iy1, iz1, w011)
+                c7, ww7 = probe_contrib(ix1, iy1, iz1, w111)
+
+                sum_w = ww0 + ww1 + ww2 + ww3 + ww4 + ww5 + ww6 + ww7
+                if sum_w <= 0.0:
+                    # all probes invalid -> fallback
+                    color = world.materials.albedo[fallback_id]
+                else:
+                    color = (c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7) / sum_w
         else:
             # Baseline: nearest-probe sampling
             ix = int(ti.floor(fx + 0.5))
@@ -274,7 +464,26 @@ class Camera:
             if ix < 0 or ix >= nx or iy < 0 or iy >= ny or iz < 0 or iz >= nz:
                 color = world.materials.albedo[fallback_id]
             else:
-                color = self.irradiance_grid[ix, iy, iz]
+                # nearest probe: perform percentage depth mismatch check (20%)
+                mean_d = self.grid_mean_distance[ix, iy, iz]
+                cell_center = self.grid_origin + vec3((ix + 0.5) * self.grid_cell_size,
+                                                     (iy + 0.5) * self.grid_cell_size,
+                                                     (iz + 0.5) * self.grid_cell_size)
+                actual_d = (p - cell_center).norm()
+                if mean_d > 1e8:
+                    color = self.irradiance_grid[ix, iy, iz]
+                else:
+                    if mean_d <= 1e-6:
+                        color = self.irradiance_grid[ix, iy, iz]
+                    else:
+                        rel = (actual_d - mean_d)
+                        if rel < 0.0:
+                            rel = -rel
+                        rel = rel / mean_d
+                        if rel <= 0.20:
+                            color = self.irradiance_grid[ix, iy, iz]
+                        else:
+                            color = world.materials.albedo[fallback_id]
 
         return color
 
@@ -347,12 +556,22 @@ class Camera:
                                                          (iz0 + 0.5) * self.grid_cell_size)
                     actual_dist = (hit.record.p - cell_center).norm()
                     mean_d = self.grid_mean_distance[ix0, iy0, iz0]
-                    # if no geometry recorded (large sentinel) allow grid; otherwise compare
-                    if mean_d > 1e8 or abs(actual_dist - mean_d) <= cfg.DISTANCE_MISMATCH_THRESHOLD * self.grid_cell_size:
+                    # if no geometry recorded allow grid; otherwise use 20% relative threshold
+                    if mean_d > 1e8:
                         color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
                     else:
-                        # mismatch -> likely occluded; fallback to material albedo
-                        color = world.materials.albedo[hit.record.id]
+                        if mean_d <= 1e-6:
+                            color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
+                        else:
+                            rel = actual_dist - mean_d
+                            if rel < 0.0:
+                                rel = -rel
+                            rel = rel / mean_d
+                            if rel <= 0.20:
+                                color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
+                            else:
+                                # mismatch -> likely occluded; fallback to material albedo
+                                color = world.materials.albedo[hit.record.id]
         else:
             color = self.get_background_color(ray.direction)
             self.normal_buffer[px, py] = vec3(0.0, 0.0, 0.0)
@@ -387,18 +606,28 @@ class Camera:
                 gx = int(ti.floor(gfx))
                 gy = int(ti.floor(gfy))
                 gz = int(ti.floor(gfz))
-                if gx < 0 or gx >= self.grid_res[0] or gy < 0 or gy >= self.grid_res[1] or gz < 0 or gz >= self.grid_res[2]:
-                    grid_color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
-                else:
-                    cell_center = self.grid_origin + vec3((gx + 0.5) * self.grid_cell_size,
-                                                          (gy + 0.5) * self.grid_cell_size,
-                                                          (gz + 0.5) * self.grid_cell_size)
-                    actual_d = (hit.record.p - cell_center).norm()
-                    mean_d = self.grid_mean_distance[gx, gy, gz]
-                    if mean_d > 1e8 or abs(actual_d - mean_d) <= cfg.DISTANCE_MISMATCH_THRESHOLD * self.grid_cell_size:
+                    if gx < 0 or gx >= self.grid_res[0] or gy < 0 or gy >= self.grid_res[1] or gz < 0 or gz >= self.grid_res[2]:
                         grid_color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
                     else:
-                        grid_color = vec3(0.0)
+                        cell_center = self.grid_origin + vec3((gx + 0.5) * self.grid_cell_size,
+                                                              (gy + 0.5) * self.grid_cell_size,
+                                                              (gz + 0.5) * self.grid_cell_size)
+                        actual_d = (hit.record.p - cell_center).norm()
+                        mean_d = self.grid_mean_distance[gx, gy, gz]
+                        if mean_d > 1e8:
+                            grid_color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
+                        else:
+                            if mean_d <= 1e-6:
+                                grid_color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
+                            else:
+                                rel = actual_d - mean_d
+                                if rel < 0.0:
+                                    rel = -rel
+                                rel = rel / mean_d
+                                if rel <= 0.20:
+                                    grid_color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
+                                else:
+                                    grid_color = vec3(0.0)
 
                 # Direct illumination: cast shadow rays to each emissive entity
                 direct = vec3(0.0)
@@ -470,7 +699,16 @@ class Camera:
                                         actual_db = (bounce_hit.record.p - cell_center_b).norm()
                                         mean_db = self.grid_mean_distance[bix, biy, biz]
                                         if mean_db <= 1e8 and abs(actual_db - mean_db) > cfg.DISTANCE_MISMATCH_THRESHOLD * self.grid_cell_size:
-                                            use_grid = False
+                                            # use percentage-based mismatch (20%)
+                                            if mean_db <= 1e-6:
+                                                use_grid = True
+                                            else:
+                                                relb = actual_db - mean_db
+                                                if relb < 0.0:
+                                                    relb = -relb
+                                                relb = relb / mean_db
+                                                if relb > 0.20:
+                                                    use_grid = False
 
                                     if use_grid:
                                         bounced_color = attenuation * self.sample_irradiance_grid(bounce_hit.record.p, world, bounce_hit.record.id, bounce_hit.record.normal)

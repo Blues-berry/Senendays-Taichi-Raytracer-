@@ -8,6 +8,7 @@ import main
 from main import spheres, cam, world
 import utils
 
+from typing import List, Dict, Any
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -175,7 +176,7 @@ def _trigger_object_movement_at_frame(frame_idx: int, trigger_frame: int = 200) 
     return True
 
 
-def _write_group_csv(group_name: str, rows: list[dict]):
+def _write_group_csv(group_name: str, rows: List[Dict[str, Any]]):
     csv_path = os.path.join(output_dir, f"ablation_{group_name}.csv")
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(
@@ -194,6 +195,34 @@ def _write_group_csv(group_name: str, rows: list[dict]):
         w.writeheader()
         w.writerows(rows)
     log_message(f"Saved group CSV: {csv_path}")
+
+
+def _save_error_heatmap(group_name: str, frame_label: str, reference_spp: int = 512):
+    """Generates and saves an error heatmap for the current state.
+
+    Assumes `cam.frame` already contains the *hybrid* result (linear).
+
+    Steps:
+      1) Build a fixed PT reference (reference_spp, default 512 spp)
+      2) Compute heatmap = abs(hybrid - pt_reference) with pseudo-color mapping
+      3) Save PNG (gamma corrected)
+    """
+    log_message(f"Generating heatmap for {group_name} at {frame_label} (PT ref={reference_spp} spp)...")
+
+    # Build PT reference (slow)
+    cam.render_pt_reference(world, target_spp=int(reference_spp), chunk_spp=16, reset=True)
+
+    # Compute heatmap (overwrites cam.frame)
+    cam.render_error_heatmap()
+
+    # Save heatmap (gamma corrected)
+    heatmap_buffer = ti.Vector.field(n=3, dtype=ti.f32, shape=cam.img_res)
+    main.average_frames(heatmap_buffer, cam.frame, 1.0)  # weight=1.0 just copies with gamma
+
+    filename = f"ERROR_{group_name}_{frame_label}.png"
+    filepath = os.path.join(output_dir, filename)
+    ti.tools.imwrite(heatmap_buffer, filepath)
+    log_message(f"Saved error heatmap: {filepath}")
 
 
 def run_group_experiments(scene_mode='cornell_box'):
@@ -283,6 +312,13 @@ def run_group_experiments(scene_mode='cornell_box'):
                     cfg.ADAPTIVE_BRIGHTNESS_THRESHOLD,
                     cfg.ADAPTIVE_SAMPLING_MULTIPLIER,
                     cfg.ADAPTIVE_MAX_MULTIPLIER,
+# Save error heatmaps at move+5 and move+50 (only for Hybrid compare mode)
+            # Using an offline fixed PT reference (512 spp) for paper-quality visualization.
+            if COMPARE_RENDER_MODE == RENDER_MODE_HYBRID and (f == movement_frame + 5 or f == movement_frame + 50):
+                rel = f - movement_frame
+                # NOTE: _save_error_heatmap overwrites cam.frame with the heatmap.
+                # That's fine because we already computed MSE/logged for this frame above.
+                _save_error_heatmap(group_name, f"move_{rel}", reference_spp=512)
                 )
 
             ti.sync()
@@ -565,6 +601,10 @@ def run_benchmark(scene_mode='cornell_box'):
             mode_name = get_mode_name(render_mode).lower().replace(" ", "_")
             filename = f"{mode_name}_frame_{current_mode_frames}.png"
             save_screenshot(gui, filename)
+
+            # If this is Hybrid mode, and the frame is move+5/move+50, save heatmap too.
+            if render_mode == RENDER_MODE_HYBRID and displacement_occurred and displacement_frame_in_mode in [5, 50]:
+                _save_error_heatmap(mode_name, f"move_frame_{displacement_frame_in_mode}")
 
         # Save screenshot at the last frame of each mode
         if current_mode_frames == mode_frames:

@@ -89,48 +89,52 @@ def setup_scene(mode: str = 'random'):
         materials.append(material.DiffuseLight(vec3(20, 20, 20)))
 
     elif mode == 'cornell_box':
-        # 用大球模拟 5 面墙（左红、右绿、其余白）
+        # 标准 Cornell Box（五面墙：左红、右绿、其余白；顶部强发光面光源；两球：金属+玻璃）
+        # 注：当前项目只有 Sphere 作为几何体，因此墙体/面光源用“大球近似平面”的方式实现。
         white = vec3(0.73, 0.73, 0.73)
         left_red = vec3(0.65, 0.05, 0.05)
         right_green = vec3(0.12, 0.45, 0.15)
 
-        # 盒子尺寸（近似）
-        # 通过“中心在±(R+offset)”的大球来近似平面
-        R = 1000.0
-        half = 2.5
+        # Cornell Box 内部空间范围（近似）：x,y,z ∈ [-half, half]，相机位于盒子外部朝 -z 看
+        half = 2.75
+        R = 1000.0  # 大球半径（越大越接近平面）
 
-        # 左右墙
-        spheres.append(Sphere(center=vec3(-(R + half), 0, 0), radius=R))
+        # === 五面墙（没有前墙，便于相机观察） ===
+        # 左墙（红）/ 右墙（绿）
+        spheres.append(Sphere(center=vec3(-(R + half), 0.0, 0.0), radius=R))
         materials.append(material.Lambert(left_red))
-        spheres.append(Sphere(center=vec3((R + half), 0, 0), radius=R))
+        spheres.append(Sphere(center=vec3((R + half), 0.0, 0.0), radius=R))
         materials.append(material.Lambert(right_green))
 
         # 地面 / 天花板 / 后墙（白）
-        spheres.append(Sphere(center=vec3(0, -(R + half), 0), radius=R))
+        spheres.append(Sphere(center=vec3(0.0, -(R + half), 0.0), radius=R))
         materials.append(material.Lambert(white))
-        spheres.append(Sphere(center=vec3(0, (R + half), 0), radius=R))
+        spheres.append(Sphere(center=vec3(0.0, (R + half), 0.0), radius=R))
         materials.append(material.Lambert(white))
-        spheres.append(Sphere(center=vec3(0, 0, -(R + half)), radius=R))
+        spheres.append(Sphere(center=vec3(0.0, 0.0, -(R + half)), radius=R))
         materials.append(material.Lambert(white))
 
-        # 顶部强发光球
-        spheres.append(Sphere(center=vec3(0, half - 0.2, -1.0), radius=0.35))
-        materials.append(material.DiffuseLight(vec3(15, 15, 15)))
+        # === 顶部面光源（用一个较大的发光球近似平面光源） ===
+        # 位置靠近天花板中央，略向后，半径增大以模拟“面光源”面积。
+        spheres.append(Sphere(center=vec3(0.0, half - 0.15, -1.0), radius=0.85))
+        materials.append(material.DiffuseLight(vec3(25.0, 25.0, 25.0)))
 
-        # 盒内：金属球 + 玻璃球
-        spheres.append(Sphere(center=vec3(-0.8, -half + 0.6, -1.2), radius=0.6))
-        materials.append(material.Metal(vec3(0.85, 0.85, 0.85), 0.02))
+        # === 盒内两球 ===
+        # 高反射金属球（低 fuzz）
+        spheres.append(Sphere(center=vec3(-0.85, -half + 0.70, -1.65), radius=0.70))
+        materials.append(material.Metal(vec3(0.93, 0.93, 0.93), 0.01))
 
-        spheres.append(Sphere(center=vec3(0.9, -half + 0.6, -0.6), radius=0.6))
+        # 折射玻璃球
+        spheres.append(Sphere(center=vec3(0.95, -half + 0.70, -0.95), radius=0.70))
         materials.append(material.Dielectric(1.5))
 
-        # Cornell Box 相机建议：在盒子外面往里看
+        # Cornell Box 相机建议：在盒子外面往里看（禁用景深）
         cam_params.update(
-            lookfrom=vec3(0, 0, 8),
-            lookat=vec3(0, -0.5, -1.0),
+            lookfrom=vec3(0.0, 0.0, 8.5),
+            lookat=vec3(0.0, -0.2, -1.3),
             vfov=40.0,
             defocus_angle=0.0,
-            focus_dist=8.0,
+            focus_dist=8.5,
         )
 
     elif mode == 'night_scene':
@@ -202,8 +206,9 @@ def setup_scene(mode: str = 'random'):
 world, cam = setup_scene(CURRENT_SCENE)
 
 # Experiment control
-render_mode = 'Adaptive'  # options: 'PT', 'Grid', 'Adaptive'
-mode_map = {'PT': 0, 'Grid': 1, 'Adaptive': 2}
+# options: 'PT', 'Grid', 'Adaptive', 'ERROR'
+render_mode = 'ERROR'
+mode_map = {'PT': 0, 'Grid': 1, 'Adaptive': 2, 'ERROR': 3}
 
 # Create results directory and timestamped experiment subdirectory
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -289,6 +294,22 @@ def main():
             # Grid-only with reduced base update (1%) to improve performance
             cam.update_grid(world, 0.01)
             cam.render(world, mode_int)
+        elif render_mode == 'ERROR':
+            # Error heatmap (real-time): compare Hybrid vs an incrementally-accumulated PT reference.
+            # This keeps the GUI responsive while PT reference converges over time.
+            # 1) produce a hybrid frame
+            cam.update_grid(world, 0.01)
+            cam.render(world, mode_map['Adaptive'])
+            cam.asvgf_filter()
+
+            # 2) incrementally accumulate PT reference (a few spp per frame)
+            if rendered_frames == 0:
+                cam.clear_pt_reference()
+            # tune this: 1~4 for interactivity
+            cam.accumulate_pt_reference(world, 2)
+
+            # 3) overwrite cam.frame with heatmap visualization
+            cam.render_error_heatmap()
         else:
             # Adaptive hybrid: we updated weights above, apply reduced base update (1%)
             cam.update_grid(world, 0.01)
@@ -316,14 +337,17 @@ def main():
         fps = (1.0 / frame_time) if frame_time > 0.0 else 0.0
         last_frame_time = now_frame
 
-        # Every 100 frames, print average FPS and grid memory usage
-        if fps_tick_count >= 100:
+        # Every 60 frames, print average FPS, grid memory usage, and PT reference spp
+        if fps_tick_count >= 60:
             now = time.perf_counter()
             elapsed = now - fps_tick_start
             avg_fps = fps_tick_count / elapsed if elapsed > 0 else 0.0
             nx, ny, nz = cam.grid_res
             grid_mem_mb = float(nx * ny * nz * 3 * 4) / (1024.0 * 1024.0)
-            print(f"[Stats] Frame {rendered_frames}: Avg FPS={avg_fps:.5f}, Grid mem={grid_mem_mb:.5f} MB")
+            print(f"[Stats] Frame {rendered_frames}: "
+                  f"FPS={avg_fps:.2f}, "
+                  f"Grid={grid_mem_mb:.2f} MB, "
+                  f"PT ref={cam.pt_spp_count[None]} spp")
             fps_tick_start = now
             fps_tick_count = 0
 
@@ -368,10 +392,24 @@ def main():
         if last_move_frame >= 0:
             rel_frame = rendered_frames - last_move_frame
             if rel_frame == 5 or rel_frame == 50:
+                # 1) save current displayed buffer
                 filename = f"{render_mode}_move_{move_count}_frame_{rel_frame}.png"
                 filepath = os.path.join(experiment_dir, filename)
                 ti.tools.imwrite(current_frame, filepath)
                 print(f"Saved screenshot: {filepath}")
+
+                # 2) additionally save error heatmap (Hybrid vs PT reference)
+                #    for paper visualization of convergence around shadow edges.
+                # For interactive ERROR mode, PT reference is accumulated incrementally.
+                # If you want an offline 1024-spp reference for the saved images, switch
+                # back to: cam.render_pt_reference(world, target_spp=1024, chunk_spp=8, reset=True)
+                cam.render_error_heatmap()
+                heatmap = ti.Vector.field(n=3, dtype=ti.f32, shape=cam.img_res)
+                average_frames(heatmap, cam.frame, 1.0)
+                heatmap_name = f"ERROR_move_{move_count}_frame_{rel_frame}.png"
+                heatmap_path = os.path.join(experiment_dir, heatmap_name)
+                ti.tools.imwrite(heatmap, heatmap_path)
+                print(f"Saved error heatmap: {heatmap_path}")
 
         # Buffer per-frame data and write in batches to avoid per-frame IO
         logs_buffer.append([rendered_frames, render_mode, f"{fps:.2f}", f"{mse:.8e}"])

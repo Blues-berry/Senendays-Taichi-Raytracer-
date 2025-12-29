@@ -606,28 +606,28 @@ class Camera:
                 gx = int(ti.floor(gfx))
                 gy = int(ti.floor(gfy))
                 gz = int(ti.floor(gfz))
-                    if gx < 0 or gx >= self.grid_res[0] or gy < 0 or gy >= self.grid_res[1] or gz < 0 or gz >= self.grid_res[2]:
+                if gx < 0 or gx >= self.grid_res[0] or gy < 0 or gy >= self.grid_res[1] or gz < 0 or gz >= self.grid_res[2]:
+                    grid_color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
+                else:
+                    cell_center = self.grid_origin + vec3((gx + 0.5) * self.grid_cell_size,
+                                                          (gy + 0.5) * self.grid_cell_size,
+                                                          (gz + 0.5) * self.grid_cell_size)
+                    actual_d = (hit.record.p - cell_center).norm()
+                    mean_d = self.grid_mean_distance[gx, gy, gz]
+                    if mean_d > 1e8:
                         grid_color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
                     else:
-                        cell_center = self.grid_origin + vec3((gx + 0.5) * self.grid_cell_size,
-                                                              (gy + 0.5) * self.grid_cell_size,
-                                                              (gz + 0.5) * self.grid_cell_size)
-                        actual_d = (hit.record.p - cell_center).norm()
-                        mean_d = self.grid_mean_distance[gx, gy, gz]
-                        if mean_d > 1e8:
+                        if mean_d <= 1e-6:
                             grid_color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
                         else:
-                            if mean_d <= 1e-6:
+                            rel = actual_d - mean_d
+                            if rel < 0.0:
+                                rel = -rel
+                            rel = rel / mean_d
+                            if rel <= 0.20:
                                 grid_color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
                             else:
-                                rel = actual_d - mean_d
-                                if rel < 0.0:
-                                    rel = -rel
-                                rel = rel / mean_d
-                                if rel <= 0.20:
-                                    grid_color = self.sample_irradiance_grid(hit.record.p, world, hit.record.id, hit.record.normal)
-                                else:
-                                    grid_color = vec3(0.0)
+                                grid_color = vec3(0.0)
 
                 # Direct illumination: cast shadow rays to each emissive entity
                 direct = vec3(0.0)

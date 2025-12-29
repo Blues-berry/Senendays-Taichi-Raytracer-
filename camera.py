@@ -9,6 +9,7 @@ from ray import Ray
 vec3 = ti.types.vector(3, float)
 
 ray_return = ti.types.struct(hit_surface=bool, resulting_ray=Ray, color=vec3)
+probe_return = ti.types.struct(color=vec3, weight=ti.f32)
 
 @ti.data_oriented
 class Camera:
@@ -205,6 +206,7 @@ class Camera:
                 is_moving = False
             else:
                 # relative depth change
+                depth_rel = 0.0
                 if d_prev > 1e-6:
                     depth_rel = d_cur - d_prev
                     if depth_rel < 0.0:
@@ -318,7 +320,7 @@ class Camera:
             # Simple blue->cyan->green->yellow->red ramp.
             # Normalize using a tunable scale (bigger => more blue overall).
             # This is a visualization; not used for metrics.
-            scale = 0.25
+            scale = 0.75
             t = err / scale
             if t < 0.0:
                 t = 0.0
@@ -349,6 +351,29 @@ class Camera:
     def defocus_disk_sample(self):
         p = utils.random_in_unit_disc()
         return self.camera_origin + self.defocus_disk_u * p[0] + self.defocus_disk_v * p[1]
+
+    @ti.func
+    def _probe_contrib(self, p: vec3, ix: ti.i32, iy: ti.i32, iz: ti.i32, w: ti.f32) -> probe_return:
+        result_color = vec3(0.0)
+        result_weight = 0.0
+        if w > 0.0:
+            cell_center = self.grid_origin + vec3((ix + 0.5) * self.grid_cell_size,
+                                                 (iy + 0.5) * self.grid_cell_size,
+                                                 (iz + 0.5) * self.grid_cell_size)
+            actual_d = (p - cell_center).norm()
+            mean_d = self.grid_mean_distance[ix, iy, iz]
+
+            use_probe = True
+            if not (mean_d > 1e8 or mean_d <= 1e-6):
+                rel = ti.abs(actual_d - mean_d) / mean_d
+                if rel > 0.20:
+                    use_probe = False
+
+            if use_probe:
+                result_color = self.irradiance_grid[ix, iy, iz] * w
+                result_weight = w
+
+        return probe_return(color=result_color, weight=result_weight)
 
     @ti.func
     def sample_irradiance_grid(self, p: vec3, world: ti.template(), fallback_id: int, normal: vec3) -> vec3:
@@ -414,48 +439,24 @@ class Camera:
                 # For each of the 8 probe corners, check mean-distance mismatch.
                 # If a probe's recorded mean distance deviates from the actual distance by >20%,
                 # zero its interpolation weight (treat it as occluded).
-                sum_w = 0.0
 
-                # helper: compute cell center and possibly zero weight
-                def probe_contrib(ix, iy, iz, w):
-                    if w <= 0.0:
-                        return vec3(0.0), 0.0
-                    cell_center = self.grid_origin + vec3((ix + 0.5) * self.grid_cell_size,
-                                                         (iy + 0.5) * self.grid_cell_size,
-                                                         (iz + 0.5) * self.grid_cell_size)
-                    actual_d = (p - cell_center).norm()
-                    mean_d = self.grid_mean_distance[ix, iy, iz]
-                    if mean_d > 1e8:
-                        # no recorded geometry -> allow probe
-                        return self.irradiance_grid[ix, iy, iz] * w, w
-                    # avoid division by zero
-                    if mean_d <= 1e-6:
-                        return self.irradiance_grid[ix, iy, iz] * w, w
-                    rel = (actual_d - mean_d)
-                    if rel < 0.0:
-                        rel = -rel
-                    rel = rel / mean_d
-                    if rel > 0.20:
-                        # occluded by depth mismatch -> drop weight
-                        return vec3(0.0), 0.0
-                    else:
-                        return self.irradiance_grid[ix, iy, iz] * w, w
+                ret0 = self._probe_contrib(p, ix0, iy0, iz0, w000)
+                ret1 = self._probe_contrib(p, ix1, iy0, iz0, w100)
+                ret2 = self._probe_contrib(p, ix0, iy1, iz0, w010)
+                ret3 = self._probe_contrib(p, ix1, iy1, iz0, w110)
+                ret4 = self._probe_contrib(p, ix0, iy0, iz1, w001)
+                ret5 = self._probe_contrib(p, ix1, iy0, iz1, w101)
+                ret6 = self._probe_contrib(p, ix0, iy1, iz1, w011)
+                ret7 = self._probe_contrib(p, ix1, iy1, iz1, w111)
 
-                c0, ww0 = probe_contrib(ix0, iy0, iz0, w000)
-                c1, ww1 = probe_contrib(ix1, iy0, iz0, w100)
-                c2, ww2 = probe_contrib(ix0, iy1, iz0, w010)
-                c3, ww3 = probe_contrib(ix1, iy1, iz0, w110)
-                c4, ww4 = probe_contrib(ix0, iy0, iz1, w001)
-                c5, ww5 = probe_contrib(ix1, iy0, iz1, w101)
-                c6, ww6 = probe_contrib(ix0, iy1, iz1, w011)
-                c7, ww7 = probe_contrib(ix1, iy1, iz1, w111)
+                sum_w = ret0.weight + ret1.weight + ret2.weight + ret3.weight + ret4.weight + ret5.weight + ret6.weight + ret7.weight
 
-                sum_w = ww0 + ww1 + ww2 + ww3 + ww4 + ww5 + ww6 + ww7
                 if sum_w <= 0.0:
                     # all probes invalid -> fallback
                     color = world.materials.albedo[fallback_id]
                 else:
-                    color = (c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7) / sum_w
+                    total_color = ret0.color + ret1.color + ret2.color + ret3.color + ret4.color + ret5.color + ret6.color + ret7.color
+                    color = total_color / sum_w
         else:
             # Baseline: nearest-probe sampling
             ix = int(ti.floor(fx + 0.5))

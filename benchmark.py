@@ -312,14 +312,15 @@ def run_group_experiments(scene_mode='cornell_box'):
                     cfg.ADAPTIVE_BRIGHTNESS_THRESHOLD,
                     cfg.ADAPTIVE_SAMPLING_MULTIPLIER,
                     cfg.ADAPTIVE_MAX_MULTIPLIER,
-# Save error heatmaps at move+5 and move+50 (only for Hybrid compare mode)
+                )
+
+            # Save error heatmaps at move+5 and move+50 (only for Hybrid compare mode)
             # Using an offline fixed PT reference (512 spp) for paper-quality visualization.
             if COMPARE_RENDER_MODE == RENDER_MODE_HYBRID and (f == movement_frame + 5 or f == movement_frame + 50):
                 rel = f - movement_frame
                 # NOTE: _save_error_heatmap overwrites cam.frame with the heatmap.
                 # That's fine because we already computed MSE/logged for this frame above.
                 _save_error_heatmap(group_name, f"move_{rel}", reference_spp=512)
-                )
 
             ti.sync()
             frame_time = time.perf_counter() - start_time

@@ -185,6 +185,7 @@ def _write_group_csv(group_name: str, rows: List[Dict[str, Any]]):
                 "frame",
                 "mse",
                 "fps",
+                "gpu_time_ms",
                 "timestamp",
                 "interpolation_on",
                 "importance_sampling_on",
@@ -325,6 +326,7 @@ def run_group_experiments(scene_mode='cornell_box'):
             ti.sync()
             frame_time = time.perf_counter() - start_time
             fps = 1.0 / frame_time if frame_time > 1e-6 else 0.0
+            gpu_time_ms = frame_time * 1000.0  # Convert to milliseconds
 
             current_linear = cam.frame.to_numpy()
             mse = calculate_accurate_mse(current_linear, pt_reference_linear)
@@ -335,6 +337,7 @@ def run_group_experiments(scene_mode='cornell_box'):
                     "frame": int(f),
                     "mse": float(mse),
                     "fps": float(fps),
+                    "gpu_time_ms": float(gpu_time_ms),
                     "timestamp": datetime.now().isoformat(),
                     "interpolation_on": bool(g.get("interpolation_on", False)),
                     "importance_sampling_on": bool(g.get("importance_sampling_on", False)),
@@ -474,6 +477,7 @@ def run_benchmark(scene_mode='cornell_box'):
         # Force synchronization after rendering to ensure completion
         ti.sync()
         frame_time = time.perf_counter() - start_time
+        gpu_time_ms = frame_time * 1000.0  # Convert to milliseconds
 
         # Debug: log detailed timing for first few frames
         if frame_count < 5:
@@ -528,6 +532,7 @@ def run_benchmark(scene_mode='cornell_box'):
             get_mode_name(render_mode),
             fps,
             mse,
+            gpu_time_ms,
             datetime.now().isoformat()
         ])
 
@@ -654,7 +659,7 @@ def flush_benchmark_data():
                 writer = csv.writer(f)
                 # Write header if file is new
                 if not file_exists:
-                    writer.writerow(["frame", "mode", "fps", "mse", "timestamp"])
+                    writer.writerow(["frame", "mode", "fps", "mse", "gpu_time_ms", "timestamp"])
                 writer.writerows(benchmark_data)
             log_message(f"Flushed {len(benchmark_data)} records to {csv_path}")
             benchmark_data.clear()

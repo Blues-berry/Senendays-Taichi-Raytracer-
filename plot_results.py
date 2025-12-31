@@ -278,7 +278,13 @@ def _read_ablation_csv(csv_path: str):
     with open(csv_path, "r", newline="") as f:
         reader = csv.DictReader(f)
         for r in reader:
-            rows.append({"frame": int(r["frame"]), "mse": float(r["mse"])})
+            rows.append({
+                "frame": int(r["frame"]),
+                "mse": float(r["mse"]),
+                "fps": float(r.get("fps", 0.0)),
+                "gpu_time_ms": float(r.get("gpu_time_ms", 0.0)),
+                "grid_memory_mb": float(r.get("grid_memory_mb", 0.0))
+            })
     return rows
 
 
@@ -355,6 +361,207 @@ def plot_ablation_mse_comparison(
     print(f"Saved: {out_pdf}")
 
 
+def plot_performance_comparison(results_dir: str, out_dir: str, 
+                               groups=("Baseline", "V1", "V2", "Full_Hybrid"),
+                               movement_frame: int = 200):
+    """Plot FPS and GPU time comparison across ablation groups."""
+    os.makedirs(out_dir, exist_ok=True)
+
+    plt.rcParams.update({
+        "font.size": 12,
+        "axes.titlesize": 13,
+        "axes.labelsize": 12,
+        "legend.fontsize": 11,
+        "lines.linewidth": 2.0,
+    })
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4))
+
+    palette = {
+        "Baseline": "#1f77b4",
+        "V1": "#ff7f0e",
+        "V2": "#2ca02c",
+        "Full_Hybrid": "#d62728",
+    }
+
+    # FPS comparison
+    for g in groups:
+        csv_path = os.path.join(results_dir, f"ablation_{g}.csv")
+        if not os.path.exists(csv_path):
+            continue
+
+        rows = _read_ablation_csv(csv_path)
+        frames = np.array([r["frame"] for r in rows], dtype=np.int64)
+        fps = np.array([r["fps"] for r in rows], dtype=np.float64)
+
+        # Filter out zero FPS values
+        mask = fps > 0
+        if np.any(mask):
+            ax1.plot(frames[mask], fps[mask], label=g, color=palette.get(g, None), alpha=0.9)
+
+    ax1.set_xlabel("Frame")
+    ax1.set_ylabel("FPS")
+    ax1.set_title("Performance Comparison (FPS)")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+    
+    # Movement marker on FPS plot
+    ax1.axvline(movement_frame, color="#808080", linestyle="--", linewidth=1.5, alpha=0.7)
+
+    # GPU time comparison
+    for g in groups:
+        csv_path = os.path.join(results_dir, f"ablation_{g}.csv")
+        if not os.path.exists(csv_path):
+            continue
+
+        rows = _read_ablation_csv(csv_path)
+        frames = np.array([r["frame"] for r in rows], dtype=np.int64)
+        gpu_time = np.array([r["gpu_time_ms"] for r in rows], dtype=np.float64)
+
+        # Filter out zero GPU time values
+        mask = gpu_time > 0
+        if np.any(mask):
+            ax2.plot(frames[mask], gpu_time[mask], label=g, color=palette.get(g, None), alpha=0.9)
+
+    ax2.set_xlabel("Frame")
+    ax2.set_ylabel("GPU Time (ms)")
+    ax2.set_title("GPU Time per Frame")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+    
+    # Movement marker on GPU time plot
+    ax2.axvline(movement_frame, color="#808080", linestyle="--", linewidth=1.5, alpha=0.7)
+
+    plt.tight_layout()
+    output_path = os.path.join(out_dir, "performance_comparison.pdf")
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"Saved: {output_path}")
+    plt.close()
+
+
+def plot_mse_fps_tradeoff(results_dir: str, out_dir: str,
+                          groups=("Baseline", "V1", "V2", "Full_Hybrid")):
+    """Plot MSE vs FPS trade-off for quality-performance analysis."""
+    os.makedirs(out_dir, exist_ok=True)
+
+    plt.rcParams.update({
+        "font.size": 12,
+        "axes.titlesize": 13,
+        "axes.labelsize": 12,
+        "legend.fontsize": 11,
+        "lines.linewidth": 2.0,
+    })
+
+    plt.figure(figsize=(7, 5))
+
+    palette = {
+        "Baseline": "#1f77b4",
+        "V1": "#ff7f0e",
+        "V2": "#2ca02c",
+        "Full_Hybrid": "#d62728",
+    }
+
+    for g in groups:
+        csv_path = os.path.join(results_dir, f"ablation_{g}.csv")
+        if not os.path.exists(csv_path):
+            continue
+
+        rows = _read_ablation_csv(csv_path)
+        mse = np.array([r["mse"] for r in rows], dtype=np.float64)
+        fps = np.array([r["fps"] for r in rows], dtype=np.float64)
+
+        # Filter valid data
+        mask = (mse > 0) & (fps > 0)
+        if np.any(mask):
+            # Use log scale for MSE
+            plt.semilogy(fps[mask], mse[mask], 'o', label=g, 
+                        color=palette.get(g, None), alpha=0.6, markersize=3)
+            # Add mean marker
+            mean_mse = np.mean(np.log10(mse[mask]))
+            mean_fps = np.mean(fps[mask])
+            plt.plot(mean_fps, 10**mean_mse, '*', markersize=12, 
+                    color=palette.get(g, None), markeredgecolor='black', markeredgewidth=1)
+
+    plt.xlabel("FPS (Performance)")
+    plt.ylabel("MSE (Error, log scale)")
+    plt.title("Quality-Performance Trade-off")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+
+    plt.tight_layout()
+    output_path = os.path.join(out_dir, "quality_performance_tradeoff.pdf")
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"Saved: {output_path}")
+    plt.close()
+
+
+def generate_ablation_summary_report(results_dir: str, out_dir: str,
+                                    groups=("Baseline", "V1", "V2", "Full_Hybrid")):
+    """Generate comprehensive ablation study summary report."""
+    os.makedirs(out_dir, exist_ok=True)
+    
+    report_path = os.path.join(out_dir, "ablation_summary_report.txt")
+    
+    with open(report_path, 'w') as f:
+        f.write("=" * 70 + "\n")
+        f.write("ABLATION STUDY SUMMARY REPORT\n")
+        f.write("=" * 70 + "\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        
+        for g in groups:
+            csv_path = os.path.join(results_dir, f"ablation_{g}.csv")
+            if not os.path.exists(csv_path):
+                f.write(f"\n[{g}]\n")
+                f.write("  CSV file not found\n")
+                continue
+            
+            rows = _read_ablation_csv(csv_path)
+            
+            # Extract metrics
+            mse_values = np.array([r["mse"] for r in rows])
+            fps_values = np.array([r["fps"] for r in rows])
+            gpu_time_values = np.array([r["gpu_time_ms"] for r in rows])
+            
+            # Filter valid data
+            valid_mse = mse_values[mse_values > 0]
+            valid_fps = fps_values[fps_values > 0]
+            valid_gpu = gpu_time_values[gpu_time_values > 0]
+            
+            f.write(f"\n[{g}] Configuration:\n")
+            if rows:
+                # Read configuration from first row
+                first_row = rows[0]
+                f.write(f"  Interpolation: {'ON' if first_row.get('interpolation_on', False) else 'OFF'}\n")
+                f.write(f"  Importance Sampling: {'ON' if first_row.get('importance_sampling_on', False) else 'OFF'}\n")
+                f.write(f"  Adaptive Logic: {'ON' if first_row.get('adaptive_logic_on', False) else 'OFF'}\n")
+            
+            f.write(f"\n  Statistics:\n")
+            f.write(f"    Total frames: {len(rows)}\n")
+            
+            if len(valid_mse) > 0:
+                f.write(f"    MSE - Min: {valid_mse.min():.6e}\n")
+                f.write(f"    MSE - Max: {valid_mse.max():.6e}\n")
+                f.write(f"    MSE - Mean: {valid_mse.mean():.6e}\n")
+                f.write(f"    MSE - Median: {np.median(valid_mse):.6e}\n")
+                f.write(f"    MSE - Std: {valid_mse.std():.6e}\n")
+            
+            if len(valid_fps) > 0:
+                f.write(f"    FPS - Min: {valid_fps.min():.2f}\n")
+                f.write(f"    FPS - Max: {valid_fps.max():.2f}\n")
+                f.write(f"    FPS - Mean: {valid_fps.mean():.2f}\n")
+                f.write(f"    FPS - Median: {np.median(valid_fps):.2f}\n")
+            
+            if len(valid_gpu) > 0:
+                f.write(f"    GPU Time - Min: {valid_gpu.min():.2f} ms\n")
+                f.write(f"    GPU Time - Max: {valid_gpu.max():.2f} ms\n")
+                f.write(f"    GPU Time - Mean: {valid_gpu.mean():.2f} ms\n")
+                f.write(f"    GPU Time - Median: {np.median(valid_gpu):.2f} ms\n")
+        
+        f.write("\n" + "=" * 70 + "\n")
+    
+    print(f"Ablation summary report saved to: {report_path}")
+
+
 def main():
     """Main function to plot benchmark / ablation results"""
     parser = argparse.ArgumentParser()
@@ -378,11 +585,33 @@ def main():
 
     # 1) New: ablation comparison (4 CSVs)
     try:
+        print("\nGenerating ablation MSE comparison...")
         plot_ablation_mse_comparison(results_dir, plots_dir)
     except FileNotFoundError as e:
         print(f"Ablation plot skipped: {e}")
 
-    # 2) Backwards-compatible: legacy benchmark_results.csv plots if present
+    # 2) Performance comparison
+    try:
+        print("\nGenerating performance comparison...")
+        plot_performance_comparison(results_dir, plots_dir)
+    except Exception as e:
+        print(f"Performance plot skipped: {e}")
+
+    # 3) Quality-Performance trade-off
+    try:
+        print("\nGenerating quality-performance trade-off...")
+        plot_mse_fps_tradeoff(results_dir, plots_dir)
+    except Exception as e:
+        print(f"Trade-off plot skipped: {e}")
+
+    # 4) Ablation summary report
+    try:
+        print("\nGenerating ablation summary report...")
+        generate_ablation_summary_report(results_dir, plots_dir)
+    except Exception as e:
+        print(f"Summary report skipped: {e}")
+
+    # 5) Backwards-compatible: legacy benchmark_results.csv plots if present
     data = read_benchmark_data(results_dir)
     if data:
         print("\nGenerating legacy MSE comparison plot...")

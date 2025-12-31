@@ -191,6 +191,7 @@ def _write_group_csv(group_name: str, rows: List[Dict[str, Any]]):
                 "importance_sampling_on",
                 "adaptive_logic_on",
                 "movement_applied",
+                "grid_memory_mb",
             ],
         )
         w.writeheader()
@@ -343,6 +344,7 @@ def run_group_experiments(scene_mode='cornell_box'):
                     "importance_sampling_on": bool(g.get("importance_sampling_on", False)),
                     "adaptive_logic_on": bool(g.get("adaptive_logic_on", False)),
                     "movement_applied": bool(moved_this_frame),
+                    "grid_memory_mb": float(cam.grid_res[0] * cam.grid_res[1] * cam.grid_res[2] * 3 * 4 / (1024.0 * 1024.0)),
                 }
             )
 

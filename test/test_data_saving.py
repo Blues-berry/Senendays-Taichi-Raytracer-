@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Test script to verify the data saving functionality
+测试脚本 - 验证数据保存功能
 """
 import os
 import csv
@@ -8,6 +9,7 @@ from datetime import datetime
 
 def test_benchmark_fix():
     print("Testing benchmark data saving fix...")
+    print("测试benchmark数据保存修复...")
     
     # Test 1: Check if timestamped directory creation works
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -50,6 +52,7 @@ def test_benchmark_fix():
 
 def test_experiment_fix():
     print("\nTesting experiment data saving fix...")
+    print("测试实验数据保存修复...")
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     experiment_dir = f"experiment_{timestamp}"
@@ -92,12 +95,15 @@ def test_experiment_fix():
     return True
 
 if __name__ == "__main__":
-    print("Running data saving fix tests...\n")
+    print("Running data saving fix tests...")
+    print("运行数据保存修复测试...\n")
     
     success1 = test_benchmark_fix()
     success2 = test_experiment_fix()
     
     if success1 and success2:
         print("\n🎉 All tests passed! Data saving should work correctly now.")
+        print("🎉 所有测试通过！数据保存应该正常工作了。")
     else:
         print("\n❌ Some tests failed. Please check the implementation.")
+        print("❌ 部分测试失败。请检查实现。")

@@ -6,33 +6,44 @@
 
 ## 概述
 
-基准测试系统自动化对比三种渲染模式的性能和质量：
+项目提供两种基准测试模式：
+
+### 模式1: 单场景消融实验 (`benchmark.py`)
+自动化对比同一场景下三种渲染模式的性能和质量：
 - **Path Tracing (PT)**: 物理精确的参考标准
 - **Pure Grid**: 纯网格快速渲染
 - **Hybrid Adaptive**: 混合自适应算法
+
+### 模式2: 多场景全面测试 (`benchmark_full.py`)
+依次运行**所有场景**，每个场景用三种方法测试：
+- 测试场景：cornell_box, two_room, night_scene, random, classroom, bathroom, veach_mis
+- 测试顺序：PT -> Grid -> Hybrid -> Error Heatmap
+- 自动记录 CSV 数据
+- 自动生成综合分析图表
 
 ---
 
 ## 快速开始
 
-### 运行完整基准测试
+### 运行单场景消融实验
 
 ```bash
 python benchmark.py
 ```
 
-测试完成后会自动生成分析图表到 `results/benchmark_results_YYYYMMDD_HHMMSS/plots/`
+测试默认场景（cornell_box），完成后自动生成分析图表。
 
-### 使用指定场景运行
+### 运行多场景全面测试（推荐）
 
-```python
-# 修改 benchmark.py 中的场景参数
-run_group_experiments('classroom')  # 或任意场景名称
+```bash
+python benchmark_full.py
 ```
+
+依次测试所有 7 个场景，每个场景完整运行三种方法 + Error 热力图。
 
 ---
 
-## 测试流程
+## 测试流程 - 模式1：单场景消融实验
 
 ### 1. 初始化阶段
 
@@ -136,7 +147,94 @@ generate_all_plots(output_dir)
 
 ---
 
+## 测试流程 - 模式2：多场景全面测试
+
+### 运行所有场景
+
+`benchmark_full.py` 依次运行所有场景：
+
+```python
+ALL_SCENES = [
+    'cornell_box',
+    'two_room',
+    'night_scene',
+    'random',
+    'classroom',
+    'bathroom',
+    'veach_mis',
+]
+
+for scene_name in ALL_SCENES:
+    run_scene_benchmark(scene_name)
+```
+
+### 单场景测试流程
+
+每个场景按以下顺序运行：
+
+#### 1. Path Tracing 模式
+```python
+# 累积 PT 参考帧（150 帧）
+for _ in range(150):
+    cam.render_pt(world)
+    ti.sync()
+    pt_accum += cam.pt_frame.to_numpy()
+
+# 计算平均作为参考
+pt_reference_linear = pt_accum / 150
+```
+
+#### 2. Pure Grid 模式
+```python
+# 渲染 200 帧
+for frame in range(200):
+    cam.update_grid(world, 0.01)
+    cam.render(world, RENDER_MODE_GRID)
+    ti.sync()
+    # 计算 MSE vs PT 参考
+    mse = calculate_mse(current, pt_reference_linear)
+    # 记录 CSV
+```
+
+#### 3. Hybrid 模式
+```python
+# 渲染 200 帧（带物体移动）
+for frame in range(200):
+    # 第 100 帧移动物体
+    if frame == 100:
+        move_object()
+
+    cam.update_grid(world, 0.01)
+    cam.render(world, RENDER_MODE_HYBRID)
+    cam.asvgf_filter()
+    ti.sync()
+    # 计算 MSE vs PT 参考
+    mse = calculate_mse(current, pt_reference_linear)
+    # 记录 CSV
+```
+
+#### 4. Error Heatmap 模式
+```python
+# 进入 Error 模式，生成误差热力图
+cam.update_grid(world, 0.01)
+cam.render(world, RENDER_MODE_HYBRID)
+cam.asvgf_filter()
+
+# 计算 PT 参考（512 spp）
+cam.render_pt_reference(world, target_spp=512, chunk_spp=16, reset=True)
+
+# 生成误差热力图（伪彩色）
+cam.render_error_heatmap()
+
+# 保存热力图
+save_screenshot(f"{scene_name}_error_heatmap.png")
+```
+
+---
+
 ## 输出文件结构
+
+### 模式1：单场景消融实验输出
 
 ```
 results/
@@ -161,6 +259,34 @@ results/
         ├── summary_report.txt
         └── BENCHMARK_ANALYSIS_REPORT.md
 ```
+
+### 模式2：多场景全面测试输出
+
+```
+results/
+└── multi_scene_benchmark_20251226_172131/
+    ├── cornell_box_results.csv           # Cornell Box 场景数据
+    ├── cornell_box_error_heatmap.png    # Cornell Box 误差热力图
+    ├── two_room_results.csv
+    ├── two_room_error_heatmap.png
+    ├── night_scene_results.csv
+    ├── night_scene_error_heatmap.png
+    ├── random_results.csv
+    ├── random_error_heatmap.png
+    ├── classroom_results.csv
+    ├── classroom_error_heatmap.png
+    ├── bathroom_results.csv
+    ├── bathroom_error_heatmap.png
+    ├── veach_mis_results.csv
+    ├── veach_mis_error_heatmap.png
+    ├── all_scenes_summary.csv          # 所有场景汇总数据
+    ├── all_scenes_mse_comparison.png    # MSE 对比图（所有场景）
+    ├── all_scenes_fps_comparison.png    # FPS 对比图（所有场景）
+    ├── all_scenes_speedup_comparison.png # 性能提升比图
+    └── benchmark_summary.txt          # 文本汇总报告
+```
+
+---
 
 ---
 

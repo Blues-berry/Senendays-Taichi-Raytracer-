@@ -135,19 +135,29 @@ python main.py
 CURRENT_SCENE = 'classroom'  # 或 cornell_box, two_room, night_scene, random, bathroom, veach_mis
 ```
 
-### 3. 运行完整基准测试
+### 3. 运行单场景消融实验
 
 ```bash
 python benchmark.py
 ```
 
-测试完成后自动生成分析图表到 `results/benchmark_results_YYYYMMDD_HHMMSS/plots/`
+测试默认场景（cornell_box），完成后自动生成分析图表。
 
-### 4. 测试所有场景
+### 4. 运行多场景全面测试（推荐）
+
+```bash
+python benchmark_full.py
+```
+
+依次测试所有 7 个场景，每个场景完整运行三种方法 + Error 热力图。
+
+### 5. 快速测试所有场景
 
 ```bash
 python scripts/test_new_scenes.py
 ```
+
+快速验证所有场景的基本渲染功能。
 
 ---
 

@@ -20,7 +20,7 @@ vec3 = ti.types.vector(3, float)
 spheres = []
 materials = []
 
-# 当前场景模式：'random', 'cornell_box', 'night_scene'
+# 当前场景模式：'random', 'cornell_box', 'night_scene', 'two_room', 'classroom', 'bathroom', 'veach_mis'
 CURRENT_SCENE = 'random'
 
 def setup_scene(mode: str = 'random'):
@@ -30,6 +30,10 @@ def setup_scene(mode: str = 'random'):
     - 'random'：原来的随机小球场景（默认）
     - 'cornell_box'：五面墙 + 顶部强光 + 金属球/玻璃球
     - 'night_scene'：黑色背景 + 多彩高亮点光源 + 高反射金属球
+    - 'two_room'：两室一门场景（测试窄缝漏光）
+    - 'classroom'：教室场景（黑板 + 窗户光）
+    - 'bathroom'：浴室场景（白瓷砖 + 镜面 + caustics）
+    - 'veach_mis'：Veach MIS 场景（多强度光源测试重要性采样）
     """
     global spheres, materials, world, cam, big_indices, prev_centers
 
@@ -39,149 +43,9 @@ def setup_scene(mode: str = 'random'):
     spheres = []
     materials = []
 
-    # 默认相机参数（不同场景会覆盖）
-    cam_params = dict(
-        lookfrom=vec3(13, 2, 3),
-        lookat=vec3(0, 0, 0),
-        vup=vec3(0, 1, 0),
-        vfov=20.0,
-        defocus_angle=0.6,
-        focus_dist=10.0,
-        scene_mode=mode,
-    )
-
-    if mode == 'random':
-        floor = Sphere(center=vec3(0, -1000, -1), radius=1000)
-        floor_mat = material.Lambert(vec3(0.5, 0.5, 0.5))
-        spheres.append(floor)
-        materials.append(floor_mat)
-
-        # Small spheres grid (deterministic via seeded RNG above)
-        for a in range(-11, 11):
-            for b in range(-11, 11):
-                choose_mat = random.random()
-                center = vec3(a + 0.9 * random.random(), 0.2, b + 0.9 * random.random())
-                if (center - vec3(4, 0.2, 0)).norm() > 0.9:
-                    if choose_mat < 0.8:
-                        spheres.append(Sphere(center=center, radius=0.2))
-                        materials.append(material.Lambert(utils.rand_vec(0, 1) * utils.rand_vec(0, 1)))
-                    elif choose_mat < 0.95:
-                        spheres.append(Sphere(center=center, radius=0.2))
-                        materials.append(material.Metal(utils.rand_vec(0.5, 1), 0.5 * random.random()))
-                    else:
-                        spheres.append(Sphere(center=center, radius=0.2))
-                        materials.append(material.Dielectric(1.5))
-
-        sph_1 = Sphere(center=vec3(0, 1, 0), radius=1)
-        spheres.append(sph_1)
-        materials.append(material.Dielectric(1.5))
-
-        sph_2 = Sphere(center=vec3(-4, 1, 0), radius=1)
-        spheres.append(sph_2)
-        materials.append(material.Lambert(vec3(0.4, 0.2, 0.1)))
-
-        sph_3 = Sphere(center=vec3(4, 1, 0), radius=1)
-        spheres.append(sph_3)
-        materials.append(material.Metal(vec3(0.7, 0.6, 0.5), 0.0))
-
-        top_light = Sphere(center=vec3(0, 5, 0), radius=0.5)
-        spheres.append(top_light)
-        materials.append(material.DiffuseLight(vec3(20, 20, 20)))
-
-    elif mode == 'cornell_box':
-        # 标准 Cornell Box（五面墙：左红、右绿、其余白；顶部强发光面光源；两球：金属+玻璃）
-        # 注：当前项目只有 Sphere 作为几何体，因此墙体/面光源用“大球近似平面”的方式实现。
-        white = vec3(0.73, 0.73, 0.73)
-        left_red = vec3(0.65, 0.05, 0.05)
-        right_green = vec3(0.12, 0.45, 0.15)
-
-        # Cornell Box 内部空间范围（近似）：x,y,z ∈ [-half, half]，相机位于盒子外部朝 -z 看
-        half = 2.75
-        R = 1000.0  # 大球半径（越大越接近平面）
-
-        # === 五面墙（没有前墙，便于相机观察） ===
-        # 左墙（红）/ 右墙（绿）
-        spheres.append(Sphere(center=vec3(-(R + half), 0.0, 0.0), radius=R))
-        materials.append(material.Lambert(left_red))
-        spheres.append(Sphere(center=vec3((R + half), 0.0, 0.0), radius=R))
-        materials.append(material.Lambert(right_green))
-
-        # 地面 / 天花板 / 后墙（白）
-        spheres.append(Sphere(center=vec3(0.0, -(R + half), 0.0), radius=R))
-        materials.append(material.Lambert(white))
-        spheres.append(Sphere(center=vec3(0.0, (R + half), 0.0), radius=R))
-        materials.append(material.Lambert(white))
-        spheres.append(Sphere(center=vec3(0.0, 0.0, -(R + half)), radius=R))
-        materials.append(material.Lambert(white))
-
-        # === 顶部面光源（用一个较大的发光球近似平面光源） ===
-        # 位置靠近天花板中央，略向后，半径增大以模拟“面光源”面积。
-        spheres.append(Sphere(center=vec3(0.0, half - 0.15, -1.0), radius=0.85))
-        materials.append(material.DiffuseLight(vec3(25.0, 25.0, 25.0)))
-
-        # === 盒内两球 ===
-        # 高反射金属球（低 fuzz）
-        spheres.append(Sphere(center=vec3(-0.85, -half + 0.70, -1.65), radius=0.70))
-        materials.append(material.Metal(vec3(0.93, 0.93, 0.93), 0.01))
-
-        # 折射玻璃球
-        spheres.append(Sphere(center=vec3(0.95, -half + 0.70, -0.95), radius=0.70))
-        materials.append(material.Dielectric(1.5))
-
-        # Cornell Box 相机建议：在盒子外面往里看（禁用景深）
-        cam_params.update(
-            lookfrom=vec3(0.0, 0.0, 8.5),
-            lookat=vec3(0.0, -0.2, -1.3),
-            vfov=40.0,
-            defocus_angle=0.0,
-            focus_dist=8.5,
-        )
-
-    elif mode == 'night_scene':
-        # 暗色地面
-        spheres.append(Sphere(center=vec3(0, -1000, 0), radius=1000))
-        materials.append(material.Lambert(vec3(0.08, 0.08, 0.09)))
-
-        # 5 个不同颜色的高亮度点光源
-        light_positions = [
-            vec3(-6, 4, -2),
-            vec3(-2, 3, 2),
-            vec3(2, 3.5, -1),
-            vec3(6, 4, 2),
-            vec3(0, 5, 6),
-        ]
-        light_colors = [
-            vec3(15, 9, 4),   # 暖橘
-            vec3(4, 10, 15),  # 冰蓝
-            vec3(14, 4, 10),  # 洋红
-            vec3(6, 15, 6),   # 绿
-            vec3(12, 12, 16), # 冷白偏蓝
-        ]
-        for p, c in zip(light_positions, light_colors):
-            spheres.append(Sphere(center=p, radius=0.35))
-            materials.append(material.DiffuseLight(c))
-
-        # 随机散布高反射金属球
-        for _ in range(25):
-            x = random.uniform(-7.0, 7.0)
-            z = random.uniform(-7.0, 7.0)
-            r = random.uniform(0.25, 0.6)
-            y = r
-            spheres.append(Sphere(center=vec3(x, y, z), radius=r))
-            # 高反射：低 fuzz
-            base = utils.rand_vec(0.7, 1.0)
-            materials.append(material.Metal(base, random.uniform(0.0, 0.08)))
-
-        cam_params.update(
-            lookfrom=vec3(0, 3, 12),
-            lookat=vec3(0, 1, 0),
-            vfov=35.0,
-            defocus_angle=0.0,
-            focus_dist=12.0,
-        )
-
-    else:
-        raise ValueError(f"未知场景模式: {mode}")
+    # 使用统一场景配置
+    from scenes.scene_configs import get_scene
+    spheres, materials, cam_params = get_scene(mode)
 
     world = World(spheres, materials)
     cam = Camera(world, **cam_params)

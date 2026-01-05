@@ -99,14 +99,23 @@ def calculate_accurate_mse(current_linear, reference_linear):
     curr_f = current_linear.astype(np.float32)
     ref_f = reference_linear.astype(np.float32)
 
-    # Normalize to [0, 1] range if needed
-    if curr_f.max() > 1.1:
+    # Normalize to [0, 1] range if needed (more robust threshold check)
+    if curr_f.max() > 255.0:
         curr_f = curr_f / 255.0
-    if ref_f.max() > 1.1:
+    if ref_f.max() > 255.0:
         ref_f = ref_f / 255.0
 
+    # Handle NaN and Inf values (robust error handling)
+    curr_f = np.nan_to_num(curr_f, nan=0.0, posinf=0.0, neginf=0.0)
+    ref_f = np.nan_to_num(ref_f, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Ensure values are in valid range [0, 1] after normalization
+    curr_f = np.clip(curr_f, 0.0, 1.0)
+    ref_f = np.clip(ref_f, 0.0, 1.0)
+
     # Calculate MSE in linear space
-    mse = np.mean((curr_f - ref_f) ** 2)
+    diff = curr_f - ref_f
+    mse = np.mean(diff ** 2)
     return float(mse)
 
 def calculate_mse(img1, img2):
@@ -326,7 +335,14 @@ def run_group_experiments(scene_mode='cornell_box'):
 
             ti.sync()
             frame_time = time.perf_counter() - start_time
-            fps = 1.0 / frame_time if frame_time > 1e-6 else 0.0
+            # Calculate FPS with filtering for extreme values
+            if frame_time > 1e-6:
+                fps = 1.0 / frame_time
+                # Filter out unreasonable FPS values
+                if fps < 0.1 or fps > 10000:
+                    fps = 0.0
+            else:
+                fps = 0.0
             gpu_time_ms = frame_time * 1000.0  # Convert to milliseconds
 
             current_linear = cam.frame.to_numpy()
@@ -632,6 +648,11 @@ def run_benchmark(scene_mode='cornell_box'):
                 # Benchmark complete
                 save_benchmark_results()
                 log_message("Benchmark completed successfully!")
+
+                # Auto-generate analysis plots
+                log_message("\n=== Auto-generating analysis plots ===")
+                auto_generate_analysis_plots(output_dir)
+
                 break
 
 @ti.kernel
@@ -649,6 +670,28 @@ def average_frames(current_frame: ti.template(), new_frame: ti.template(), weigh
         new_linear = new_frame[i, j]
         avg_linear = (1.0 - weight) * curr_linear + weight * new_linear
         current_frame[i, j] = utils.linear_to_gamma_vec3(avg_linear)
+
+def auto_generate_analysis_plots(results_dir: str):
+    """Automatically generate all analysis plots after benchmark completes"""
+    try:
+        # Import plotting manager
+        from plots.plot_manager import generate_all_plots
+
+        log_message(f"Generating plots from: {results_dir}")
+        generate_all_plots(results_dir)
+
+        log_message("\n=== Analysis Complete ===")
+        log_message("Generated files:")
+        plots_dir = os.path.join(results_dir, "plots")
+        if os.path.exists(plots_dir):
+            for file in os.listdir(plots_dir):
+                if file.endswith(('.png', '.txt', '.md')):
+                    log_message(f"  - {file}")
+
+    except Exception as e:
+        log_message(f"WARNING: Failed to auto-generate plots: {e}")
+        log_message("You can manually run: python -c \"from plots.plot_manager import generate_all_plots; generate_all_plots('results/YOUR_RESULTS_DIR')\"")
+
 
 def flush_benchmark_data():
     """Flush any pending benchmark data to CSV immediately"""

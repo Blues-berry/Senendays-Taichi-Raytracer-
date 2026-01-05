@@ -162,9 +162,16 @@ def run_quick_test(scene_mode='cornell_box', test_frames=100):
             
             ti.sync()
             frame_time = time.perf_counter() - start_time
-            fps = 1.0 / frame_time if frame_time > 1e-6 else 0.0
+            # Calculate FPS with filtering for extreme values
+            if frame_time > 1e-6:
+                fps = 1.0 / frame_time
+                # Filter out unreasonable FPS values
+                if fps < 0.1 or fps > 10000:
+                    fps = 0.0
+            else:
+                fps = 0.0
             gpu_time_ms = frame_time * 1000.0
-            
+
             current_linear = cam.frame.to_numpy()
             mse = calculate_mse(current_linear, pt_reference_linear)
             

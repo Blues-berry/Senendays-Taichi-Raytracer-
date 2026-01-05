@@ -133,6 +133,8 @@ class Camera:
         self.grid_origin = vec3(-8.0, -1.0, -8.0)
         self.grid_cell_size = 1.0
         self.irradiance_grid = ti.Vector.field(n=3, dtype=ti.f32, shape=self.grid_res)
+        # Normal grid for anti-leaking (stores accumulated normals at each cell)
+        self.normal_grid = ti.Vector.field(n=3, dtype=ti.f32, shape=self.grid_res)
         # Per-cell weight multiplier for update probability (default 1.0)
         self.grid_update_weight = ti.field(dtype=ti.f32, shape=self.grid_res)
         # Per-cell luminance mean and variance for variance-guided updates
@@ -144,9 +146,10 @@ class Camera:
         self.grid_update_weight_tmp = ti.field(dtype=ti.f32, shape=self.grid_res)
         # initialize weights to 1.0
         self.grid_update_weight.fill(1.0)
-        # initialize variance/mean/distance defaults
+        # initialize variance/mean/distance/normal defaults
         self.irradiance_mean_lum.fill(0.0)
         self.irradiance_variance.fill(0.0)
+        self.normal_grid.fill(0.0)
         # large sentinel distance (means "no geometry recorded yet")
         self.grid_mean_distance.fill(1e9)
 
@@ -353,7 +356,7 @@ class Camera:
         return self.camera_origin + self.defocus_disk_u * p[0] + self.defocus_disk_v * p[1]
 
     @ti.func
-    def _probe_contrib(self, p: vec3, ix: ti.i32, iy: ti.i32, iz: ti.i32, w: ti.f32) -> probe_return:
+    def _probe_contrib(self, p: vec3, ix: ti.i32, iy: ti.i32, iz: ti.i32, w: ti.f32, query_normal: vec3) -> probe_return:
         result_color = vec3(0.0)
         result_weight = 0.0
         if w > 0.0:
@@ -368,6 +371,31 @@ class Camera:
                 rel = ti.abs(actual_d - mean_d) / mean_d
                 if rel > 0.20:
                     use_probe = False
+
+            # Anti-leak mechanism: normal-weighted interpolation
+            if ti.static(cfg.NORMAL_WEIGHTING_ENABLED) and use_probe:
+                stored_normal = self.normal_grid[ix, iy, iz]
+                if stored_normal.norm() > 1e-6:
+                    # Normalize stored normal
+                    n_stored = stored_normal.normalized()
+                    # Compute alignment with query normal (clamp to [0,1])
+                    n_dot = tm.max(0.0, query_normal.dot(n_stored))
+                    # Apply power for stricter filtering
+                    normal_weight = tm.pow(n_dot, ti.static(cfg.NORMAL_POWER))
+                    # Only trust cells with similar normals
+                    if normal_weight < 0.01:
+                        use_probe = False
+                    else:
+                        w = w * normal_weight
+
+            # Anti-leak mechanism: distance-based weighting
+            if ti.static(cfg.DISTANCE_WEIGHTING_ENABLED) and use_probe:
+                dist_weight = 1.0 / (actual_d * actual_d + 1e-6)
+                # Cutoff if too far
+                cutoff = ti.static(cfg.DISTANCE_CUTOFF_MULTIPLIER) * self.grid_cell_size
+                if actual_d > cutoff:
+                    dist_weight = 0.0
+                w = w * dist_weight
 
             if use_probe:
                 result_color = self.irradiance_grid[ix, iy, iz] * w
@@ -440,14 +468,14 @@ class Camera:
                 # If a probe's recorded mean distance deviates from the actual distance by >20%,
                 # zero its interpolation weight (treat it as occluded).
 
-                ret0 = self._probe_contrib(p, ix0, iy0, iz0, w000)
-                ret1 = self._probe_contrib(p, ix1, iy0, iz0, w100)
-                ret2 = self._probe_contrib(p, ix0, iy1, iz0, w010)
-                ret3 = self._probe_contrib(p, ix1, iy1, iz0, w110)
-                ret4 = self._probe_contrib(p, ix0, iy0, iz1, w001)
-                ret5 = self._probe_contrib(p, ix1, iy0, iz1, w101)
-                ret6 = self._probe_contrib(p, ix0, iy1, iz1, w011)
-                ret7 = self._probe_contrib(p, ix1, iy1, iz1, w111)
+                ret0 = self._probe_contrib(p, ix0, iy0, iz0, w000, normal)
+                ret1 = self._probe_contrib(p, ix1, iy0, iz0, w100, normal)
+                ret2 = self._probe_contrib(p, ix0, iy1, iz0, w010, normal)
+                ret3 = self._probe_contrib(p, ix1, iy1, iz0, w110, normal)
+                ret4 = self._probe_contrib(p, ix0, iy0, iz1, w001, normal)
+                ret5 = self._probe_contrib(p, ix1, iy0, iz1, w101, normal)
+                ret6 = self._probe_contrib(p, ix0, iy1, iz1, w011, normal)
+                ret7 = self._probe_contrib(p, ix1, iy1, iz1, w111, normal)
 
                 sum_w = ret0.weight + ret1.weight + ret2.weight + ret3.weight + ret4.weight + ret5.weight + ret6.weight + ret7.weight
 
@@ -797,9 +825,10 @@ class Camera:
                     samples = 1
 
                 acc_col = vec3(0.0)
-                # accumulate distances for mean_distance update
+                # accumulate distances and normals for updates
                 sum_dist = 0.0
                 hit_count = 0
+                acc_normal = vec3(0.0)
                 for s in range(ti.static(cfg.MAX_PROBE_SAMPLES)):
                     if s >= samples:
                         # skip remaining static iterations
@@ -860,6 +889,8 @@ class Camera:
                                 # record distance from probe pos to hit point
                                 diff = hit.record.p - pos
                                 sample_dist = tm.sqrt(diff.dot(diff))
+                                # accumulate normal for anti-leaking
+                                acc_normal += hit.record.normal
                                 hit_count += 1
                                 break
                         else:
@@ -877,6 +908,18 @@ class Camera:
                 old = self.irradiance_grid[i, j, k]
                 a = self.grid_update_alpha
                 self.irradiance_grid[i, j, k] = old * (1.0 - a) + new_col * a
+
+                # Update normal grid (accumulate normals, then normalize for use in sampling)
+                if hit_count > 0:
+                    avg_normal = acc_normal / float(hit_count)
+                    if avg_normal.norm() > 1e-6:
+                        avg_normal = avg_normal.normalized()
+                    old_normal = self.normal_grid[i, j, k]
+                    self.normal_grid[i, j, k] = old_normal * (1.0 - a) + avg_normal * a
+                    # Re-normalize to keep it as a proper direction vector
+                    if self.normal_grid[i, j, k].norm() > 1e-6:
+                        self.normal_grid[i, j, k] = self.normal_grid[i, j, k].normalized()
+
                 # update luminance mean & variance (exponential moving)
                 lum_new = 0.2126 * new_col[0] + 0.7152 * new_col[1] + 0.0722 * new_col[2]
                 old_lum = self.irradiance_mean_lum[i, j, k]
@@ -1094,7 +1137,7 @@ class Camera:
                     max_z = cz + r
 
         # pad slightly to avoid boundary issues
-        pad = 0.5  # Increased padding for better coverage
+        pad = cfg.GRID_PADDING
         min_x -= pad
         min_y -= pad
         min_z -= pad
@@ -1132,6 +1175,21 @@ class Camera:
             print(f"Grid coverage: {nx*cell:.2f} x {ny*cell:.2f} x {nz*cell:.2f}")
             print(f"Total spheres: {len(spheres)}")
             print("=====================\n")
+
+        # CRITICAL: Clear grid data to prevent ghosting/leaking after object movement
+        self.clear_grid_data()
+
+    def clear_grid_data(self):
+        """Clear irradiance grid, normal grid, and statistics to prevent ghosting after movement."""
+        self.irradiance_grid.fill(0.0)
+        self.normal_grid.fill(0.0)
+        self.irradiance_mean_lum.fill(0.0)
+        self.irradiance_variance.fill(0.0)
+        self.grid_mean_distance.fill(1e9)
+        self.grid_update_weight.fill(1.0)
+        self.accum_frame.fill(0.0)
+        self.prev_normal_buffer.fill(0.0)
+        self.prev_depth_buffer.fill(1e9)
 
     def set_light_sources(self, spheres: ti.template(), materials_list: ti.template()):
         """

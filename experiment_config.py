@@ -26,8 +26,8 @@ ADAPTIVE_INFLUENCE_RADIUS = 3.0          # Influence radius as multiple of spher
 GAUSSIAN_BLUR_ENABLED = False            # Enable Gaussian blur for weight smoothing
 
 # Grid Settings
-GRID_RESOLUTION = (32, 32, 32)            # Grid resolution
-GRID_PADDING = 0.5                        # Padding around scene AABB
+GRID_RESOLUTION = (64, 48, 64)            # Grid resolution (upgraded from 32x32x32)
+GRID_PADDING = 1.0                        # Padding around scene AABB
 
 # Adaptive sampling settings (brightness-based)
 ADAPTIVE_BRIGHTNESS_THRESHOLD = 0.05      # Luminance contrast threshold to trigger extra samples
@@ -42,6 +42,13 @@ MAX_PROBE_SAMPLES = 16                    # Upper bound for per-cell probe sampl
 
 # Distance-based leak prevention
 DISTANCE_MISMATCH_THRESHOLD = 1.0         # Threshold (in multiples of cell size) to detect mismatch
+
+# Anti-Leak Mechanisms
+NORMAL_WEIGHTING_ENABLED = True            # Enable normal-weighted interpolation (prevents cross-surface bleeding)
+NORMAL_POWER = 8.0                        # Power for normal alignment (higher = stricter)
+DISTANCE_WEIGHTING_ENABLED = True          # Enable distance-based weighting
+DISTANCE_CUTOFF_MULTIPLIER = 1.5         # Zero weight if distance > CUTOFF * cell_size
+NEIGHBOR_CLAMPING_ENABLED = True          # Enable neighbor clamping (clamp to max of 26 neighbors)
 
 # Output Settings
 OUTPUT_DIRECTORY = "experiment_results"

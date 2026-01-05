@@ -18,36 +18,49 @@ import matplotlib.pyplot as plt
 #   interpolation_on         (tri-linear interpolation)
 #   importance_sampling_on   (light importance sampling / light-guided probes)
 #   adaptive_logic_on        (adaptive weight update)
+#   normal_weighting_on      (normal-weighted interpolation - NEW)
 #
 # Required runs (in order):
-#   Baseline      : all OFF
-#   V1            : interpolation only
-#   V2            : interpolation + adaptive
-#   Full_Hybrid   : all ON
+#   Baseline            : all OFF
+#   V1                  : interpolation only
+#   V2                  : interpolation + adaptive
+#   V3                  : interpolation + normal-weighting (NEW - proves anti-leaking)
+#   Full_Hybrid         : all ON (including normal-weighting)
 EXPERIMENT_GROUPS = [
     {
         "name": "Baseline",
         "interpolation_on": False,
         "importance_sampling_on": False,
         "adaptive_logic_on": False,
+        "normal_weighting_on": False,
     },
     {
         "name": "V1",
         "interpolation_on": True,
         "importance_sampling_on": False,
         "adaptive_logic_on": False,
+        "normal_weighting_on": False,
     },
     {
         "name": "V2",
         "interpolation_on": True,
         "importance_sampling_on": False,
         "adaptive_logic_on": True,
+        "normal_weighting_on": False,
+    },
+    {
+        "name": "V3_Normal_Weighting",
+        "interpolation_on": True,
+        "importance_sampling_on": False,
+        "adaptive_logic_on": False,
+        "normal_weighting_on": True,
     },
     {
         "name": "Full_Hybrid",
         "interpolation_on": True,
         "importance_sampling_on": True,
         "adaptive_logic_on": True,
+        "normal_weighting_on": True,
     },
 ]
 
@@ -161,9 +174,17 @@ def _apply_ablation_toggles(group_cfg: dict):
 
     Adaptive logic is controlled in this benchmark by whether we call
     cam.compute_adaptive_weights() each frame.
+
+    Normal weighting is controlled via experiment config (cfg.NORMAL_WEIGHTING_ENABLED).
     """
     cam.interpolate_grid_sampling = bool(group_cfg.get("interpolation_on", False))
     cam.enable_light_guided_probes = bool(group_cfg.get("importance_sampling_on", False))
+
+    # Toggle normal-weighting via global config
+    import experiment_config as cfg
+    cfg.NORMAL_WEIGHTING_ENABLED = bool(group_cfg.get("normal_weighting_on", False))
+    cfg.DISTANCE_WEIGHTING_ENABLED = bool(group_cfg.get("normal_weighting_on", False))
+    cfg.NEIGHBOR_CLAMPING_ENABLED = bool(group_cfg.get("normal_weighting_on", False))
 
 
 def _trigger_object_movement_at_frame(frame_idx: int, trigger_frame: int = 200) -> bool:

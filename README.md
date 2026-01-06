@@ -66,7 +66,7 @@ pip install taichi numpy matplotlib
 Senendays-Taichi-Raytracer/
 ├── 📄 核心文件
 │   ├── main.py                 # 主程序入口
-│   ├── benchmark.py           # 性能基准测试（含自动分析）
+│   ├── ablation.py            # 单场景消融实验（原 benchmark.py，含自动分析）
 │   ├── camera.py              # 相机与渲染核心
 │   ├── material.py            # 材质系统
 │   ├── world.py               # 场景管理
@@ -138,7 +138,7 @@ CURRENT_SCENE = 'classroom'  # 或 cornell_box, two_room, night_scene, random, b
 ### 3. 运行单场景消融实验
 
 ```bash
-python benchmark.py
+python ablation.py
 ```
 
 测试默认场景（cornell_box），完成后自动生成分析图表。

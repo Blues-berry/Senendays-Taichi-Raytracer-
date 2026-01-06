@@ -18,49 +18,61 @@ import matplotlib.pyplot as plt
 #   interpolation_on         (tri-linear interpolation)
 #   importance_sampling_on   (light importance sampling / light-guided probes)
 #   adaptive_logic_on        (adaptive weight update)
-#   normal_weighting_on      (normal-weighted interpolation - NEW)
+#   normal_weighting_on      (normal-weighted interpolation)
+#   distance_weighting_on    (distance-based weighting + cutoff)
+#   neighbor_clamping_on     (26-neighbor clamp)
 #
 # Required runs (in order):
 #   Baseline            : all OFF
 #   V1                  : interpolation only
 #   V2                  : interpolation + adaptive
-#   V3                  : interpolation + normal-weighting (NEW - proves anti-leaking)
-#   Full_Hybrid         : all ON (including normal-weighting)
+#   V3                  : interpolation + normal-weighting ONLY (proves anti-leaking independently)
+#   Full_Hybrid         : all ON
 EXPERIMENT_GROUPS = [
-    # {
-    #     "name": "Baseline",
-    #     "interpolation_on": False,
-    #     "importance_sampling_on": False,
-    #     "adaptive_logic_on": False,
-    #     "normal_weighting_on": False,
-    # },
-    # {
-    #     "name": "V1",
-    #     "interpolation_on": True,
-    #     "importance_sampling_on": False,
-    #     "adaptive_logic_on": False,
-    #     "normal_weighting_on": False,
-    # },
-    # {
-    #     "name": "V2",
-    #     "interpolation_on": True,
-    #     "importance_sampling_on": False,
-    #     "adaptive_logic_on": True,
-    #     "normal_weighting_on": False,
-    # },
-    # {
-    #     "name": "V3_Normal_Weighting",
-    #     "interpolation_on": True,
-    #     "importance_sampling_on": False,
-    #     "adaptive_logic_on": False,
-    #     "normal_weighting_on": True,
-    # },
     {
-        "name": "Full_Hybrid",
+        "name": "Baseline",
+        "interpolation_on": False,
+        "importance_sampling_on": False,
+        "adaptive_logic_on": False,
+        "normal_weighting_on": False,
+        "distance_weighting_on": False,
+        "neighbor_clamping_on": False,
+    },
+    {
+        "name": "V1_Trilinear",
+        "interpolation_on": True,
+        "importance_sampling_on": False,
+        "adaptive_logic_on": False,
+        "normal_weighting_on": False,
+        "distance_weighting_on": False,
+        "neighbor_clamping_on": False,
+    },
+    {
+        "name": "V2_Trilinear_Adaptive",
+        "interpolation_on": True,
+        "importance_sampling_on": False,
+        "adaptive_logic_on": True,
+        "normal_weighting_on": False,
+        "distance_weighting_on": False,
+        "neighbor_clamping_on": False,
+    },
+    {
+        "name": "V3_Normal_Only",
+        "interpolation_on": True,
+        "importance_sampling_on": False,
+        "adaptive_logic_on": False,
+        "normal_weighting_on": True,
+        "distance_weighting_on": False,
+        "neighbor_clamping_on": False,
+    },
+    {
+        "name": "Full",
         "interpolation_on": True,
         "importance_sampling_on": True,
         "adaptive_logic_on": True,
         "normal_weighting_on": True,
+        "distance_weighting_on": True,
+        "neighbor_clamping_on": True,
     },
 ]
 
@@ -166,7 +178,7 @@ def plot_mse_curves(mse_by_group, out_path, title):
 
 
 def _apply_ablation_toggles(group_cfg: dict):
-    """Apply ablation toggles to the camera.
+    """Apply ablation toggles to the camera + global experiment config.
 
     This benchmark expects camera.py to expose:
       - cam.interpolate_grid_sampling
@@ -175,16 +187,22 @@ def _apply_ablation_toggles(group_cfg: dict):
     Adaptive logic is controlled in this benchmark by whether we call
     cam.compute_adaptive_weights() each frame.
 
-    Normal weighting is controlled via experiment config (cfg.NORMAL_WEIGHTING_ENABLED).
+    Anti-leak mechanisms are controlled via experiment_config (cfg.*):
+      - NORMAL_WEIGHTING_ENABLED
+      - DISTANCE_WEIGHTING_ENABLED
+      - NEIGHBOR_CLAMPING_ENABLED
+
+    IMPORTANT: These must be independently switchable for a rigorous ablation.
     """
     cam.interpolate_grid_sampling = bool(group_cfg.get("interpolation_on", False))
     cam.enable_light_guided_probes = bool(group_cfg.get("importance_sampling_on", False))
 
-    # Toggle normal-weighting via global config
     import experiment_config as cfg
+
+    # Independent anti-leak toggles
     cfg.NORMAL_WEIGHTING_ENABLED = bool(group_cfg.get("normal_weighting_on", False))
-    cfg.DISTANCE_WEIGHTING_ENABLED = bool(group_cfg.get("normal_weighting_on", False))
-    cfg.NEIGHBOR_CLAMPING_ENABLED = bool(group_cfg.get("normal_weighting_on", False))
+    cfg.DISTANCE_WEIGHTING_ENABLED = bool(group_cfg.get("distance_weighting_on", False))
+    cfg.NEIGHBOR_CLAMPING_ENABLED = bool(group_cfg.get("neighbor_clamping_on", False))
 
 
 def _trigger_object_movement_at_frame(frame_idx: int, trigger_frame: int = 200) -> bool:
@@ -220,6 +238,9 @@ def _write_group_csv(group_name: str, rows: List[Dict[str, Any]]):
                 "interpolation_on",
                 "importance_sampling_on",
                 "adaptive_logic_on",
+                "normal_weighting_on",
+                "distance_weighting_on",
+                "neighbor_clamping_on",
                 "movement_applied",
                 "grid_memory_mb",
             ],
@@ -380,6 +401,9 @@ def run_group_experiments(scene_mode='cornell_box'):
                     "interpolation_on": bool(g.get("interpolation_on", False)),
                     "importance_sampling_on": bool(g.get("importance_sampling_on", False)),
                     "adaptive_logic_on": bool(g.get("adaptive_logic_on", False)),
+                    "normal_weighting_on": bool(g.get("normal_weighting_on", False)),
+                    "distance_weighting_on": bool(g.get("distance_weighting_on", False)),
+                    "neighbor_clamping_on": bool(g.get("neighbor_clamping_on", False)),
                     "movement_applied": bool(moved_this_frame),
                     "grid_memory_mb": float(cam.grid_res[0] * cam.grid_res[1] * cam.grid_res[2] * 3 * 4 / (1024.0 * 1024.0)),
                 }

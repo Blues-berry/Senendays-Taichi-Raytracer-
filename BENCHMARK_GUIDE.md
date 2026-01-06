@@ -8,7 +8,7 @@
 
 项目提供两种基准测试模式：
 
-### 模式1: 单场景消融实验 (`benchmark.py`)
+### 模式1: 单场景消融实验 (`ablation.py`)
 自动化对比同一场景下三种渲染模式的性能和质量：
 - **Path Tracing (PT)**: 物理精确的参考标准
 - **Pure Grid**: 纯网格快速渲染
@@ -28,7 +28,7 @@
 ### 运行单场景消融实验
 
 ```bash
-python benchmark.py
+python ablation.py
 ```
 
 测试默认场景（cornell_box），完成后自动生成分析图表。
@@ -431,7 +431,7 @@ save_results_summary(csv_path)
 ### 修改测试帧数
 
 ```python
-# benchmark.py
+# ablation.py
 TEST_FRAMES = {
     'pt': 150,           # PT 帧数
     'grid': 600,         # Grid 帧数
@@ -442,21 +442,21 @@ TEST_FRAMES = {
 ### 修改移动间隔
 
 ```python
-# benchmark.py
+# ablation.py
 MOVE_INTERVAL = 200  # 每 N 帧移动一次
 ```
 
 ### 修改截图帧
 
 ```python
-# benchmark.py
+# ablation.py
 SCREENSHOT_FRAMES = [5, 50, 100, 150, 200, 300]
 ```
 
 ### 禁用自动分析
 
 ```python
-# benchmark.py
+# ablation.py
 AUTO_GENERATE_PLOTS = False  # 禁用自动生成图表
 ```
 

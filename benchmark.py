@@ -27,34 +27,34 @@ import matplotlib.pyplot as plt
 #   V3                  : interpolation + normal-weighting (NEW - proves anti-leaking)
 #   Full_Hybrid         : all ON (including normal-weighting)
 EXPERIMENT_GROUPS = [
-    {
-        "name": "Baseline",
-        "interpolation_on": False,
-        "importance_sampling_on": False,
-        "adaptive_logic_on": False,
-        "normal_weighting_on": False,
-    },
-    {
-        "name": "V1",
-        "interpolation_on": True,
-        "importance_sampling_on": False,
-        "adaptive_logic_on": False,
-        "normal_weighting_on": False,
-    },
-    {
-        "name": "V2",
-        "interpolation_on": True,
-        "importance_sampling_on": False,
-        "adaptive_logic_on": True,
-        "normal_weighting_on": False,
-    },
-    {
-        "name": "V3_Normal_Weighting",
-        "interpolation_on": True,
-        "importance_sampling_on": False,
-        "adaptive_logic_on": False,
-        "normal_weighting_on": True,
-    },
+    # {
+    #     "name": "Baseline",
+    #     "interpolation_on": False,
+    #     "importance_sampling_on": False,
+    #     "adaptive_logic_on": False,
+    #     "normal_weighting_on": False,
+    # },
+    # {
+    #     "name": "V1",
+    #     "interpolation_on": True,
+    #     "importance_sampling_on": False,
+    #     "adaptive_logic_on": False,
+    #     "normal_weighting_on": False,
+    # },
+    # {
+    #     "name": "V2",
+    #     "interpolation_on": True,
+    #     "importance_sampling_on": False,
+    #     "adaptive_logic_on": True,
+    #     "normal_weighting_on": False,
+    # },
+    # {
+    #     "name": "V3_Normal_Weighting",
+    #     "interpolation_on": True,
+    #     "importance_sampling_on": False,
+    #     "adaptive_logic_on": False,
+    #     "normal_weighting_on": True,
+    # },
     {
         "name": "Full_Hybrid",
         "interpolation_on": True,
@@ -265,8 +265,8 @@ def run_group_experiments(scene_mode='cornell_box'):
     mse_by_group = {g['name']: [] for g in EXPERIMENT_GROUPS}
 
     # Shared settings
-    movement_frame = 200
-    test_frames = 450
+    movement_frame = 50
+    test_frames = 100 # Reduced from 450 to prevent timeout
 
     for gi, g in enumerate(EXPERIMENT_GROUPS):
         group_name = g["name"]

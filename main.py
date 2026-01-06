@@ -130,9 +130,12 @@ def main():
                 moved_indices.append(idx)
                 prev_centers[idx_i] = cur_center
 
-            # If any big sphere moved, re-adapt grid to scene bounds
+            # If any big sphere moved, clear grids and re-adapt bounds
             if len(moved_indices) > 0:
-                print(f"Frame {rendered_frames}: Large sphere moved, re-adapting grid...")
+                print(f"Frame {rendered_frames}: Large sphere moved, clearing grids and re-adapting...")
+                # Clear old cache to prevent ghosting/leaking
+                cam.irradiance_grid.fill(0.0)
+                cam.normal_grid.fill(0.0)
                 cam.adapt_grid_to_scene(spheres, verbose=True)
 
         # Reset weights to 1.0 using Taichi field fill (avoids expensive Python loops)

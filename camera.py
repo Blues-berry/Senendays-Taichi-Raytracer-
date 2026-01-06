@@ -376,26 +376,23 @@ class Camera:
             if ti.static(cfg.NORMAL_WEIGHTING_ENABLED) and use_probe:
                 stored_normal = self.normal_grid[ix, iy, iz]
                 if stored_normal.norm() > 1e-6:
-                    # Normalize stored normal
                     n_stored = stored_normal.normalized()
-                    # Compute alignment with query normal (clamp to [0,1])
                     n_dot = tm.max(0.0, query_normal.dot(n_stored))
-                    # Apply power for stricter filtering
-                    normal_weight = tm.pow(n_dot, ti.static(cfg.NORMAL_POWER))
-                    # Only trust cells with similar normals
+                    normal_weight = tm.pow(n_dot, 8.0) # Use power of 8 as per instructions
                     if normal_weight < 0.01:
                         use_probe = False
                     else:
-                        w = w * normal_weight
+                        w *= normal_weight
 
             # Anti-leak mechanism: distance-based weighting
             if ti.static(cfg.DISTANCE_WEIGHTING_ENABLED) and use_probe:
-                dist_weight = 1.0 / (actual_d * actual_d + 1e-6)
+                dist_sq = actual_d * actual_d
+                dist_weight = 1.0 / (dist_sq + 1e-6) # 1/(dist^2 + eps)
                 # Cutoff if too far
-                cutoff = ti.static(cfg.DISTANCE_CUTOFF_MULTIPLIER) * self.grid_cell_size
+                cutoff = 1.5 * self.grid_cell_size
                 if actual_d > cutoff:
                     dist_weight = 0.0
-                w = w * dist_weight
+                w *= dist_weight
 
             if use_probe:
                 result_color = self.irradiance_grid[ix, iy, iz] * w
@@ -485,6 +482,23 @@ class Camera:
                 else:
                     total_color = ret0.color + ret1.color + ret2.color + ret3.color + ret4.color + ret5.color + ret6.color + ret7.color
                     color = total_color / sum_w
+
+                    # Anti-leak mechanism: Neighbor Clamping
+                    if ti.static(cfg.NEIGHBOR_CLAMPING_ENABLED):
+                        max_neighbor_irradiance = vec3(0.0)
+                        # Iterate over 3x3x3 neighborhood, excluding the center cell itself
+                        for di in ti.static(range(-1, 2)):
+                            for dj in ti.static(range(-1, 2)):
+                                for dk in ti.static(range(-1, 2)):
+                                    if not (di == 0 and dj == 0 and dk == 0):
+                                        ni, nj, nk = ix0 + di, iy0 + dj, iz0 + dk
+                                        # Check bounds
+                                        if 0 <= ni < nx and 0 <= nj < ny and 0 <= nk < nz:
+                                            neighbor_val = self.irradiance_grid[ni, nj, nk]
+                                            max_neighbor_irradiance = tm.max(max_neighbor_irradiance, neighbor_val)
+
+                        # Clamp the final color to the max of the neighbors
+                        color = tm.min(color, max_neighbor_irradiance)
         else:
             # Baseline: nearest-probe sampling
             ix = int(ti.floor(fx + 0.5))
@@ -1061,33 +1075,80 @@ class Camera:
         for i, j in self.frame:
             self.frame[i, j] = self.denoised_frame[i, j]
 
+    @ti.func
+    def rgb_to_luminance(self, color: vec3) -> ti.f32:
+        return 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2]
+        
     @ti.kernel
     def compute_adaptive_weights(self, threshold: ti.f32, multiplier: ti.f32, max_mul: ti.f32):
-        # Simple local contrast-based adaptive weight map
+        # 临时场用于存储中间计算结果
+        temp_luminance = ti.field(dtype=ti.f32, shape=self.img_res)
+        edge_strength = ti.field(dtype=ti.f32, shape=self.img_res)
+        local_variance = ti.field(dtype=ti.f32, shape=self.img_res)
+        
+        # 第一步：计算亮度图
         for i, j in self.frame:
-            c0 = self.frame[i, j]
-            lum0 = 0.2126 * c0[0] + 0.7152 * c0[1] + 0.0722 * c0[2]
-            max_l = lum0
-            min_l = lum0
+            temp_luminance[i, j] = self.rgb_to_luminance(self.frame[i, j])
+        
+        # 第二步：使用Sobel算子计算边缘强度
+        sobel_kernel_x = ti.Matrix([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
+        sobel_kernel_y = ti.Matrix([[-1, -2, -1], [0, 0, 0], [1, 2, 1]])
+        
+        for i, j in ti.ndrange((1, self.img_res[0]-1), (1, self.img_res[1]-1)):
+            gx = 0.0
+            gy = 0.0
+            
             for di in ti.static(range(-1, 2)):
                 for dj in ti.static(range(-1, 2)):
-                    ni = i + di
-                    nj = j + dj
-                    if 0 <= ni < self.img_res[0] and 0 <= nj < self.img_res[1]:
-                        cn = self.frame[ni, nj]
-                        l = 0.2126 * cn[0] + 0.7152 * cn[1] + 0.0722 * cn[2]
-                        if l > max_l:
-                            max_l = l
-                        if l < min_l:
-                            min_l = l
-            contrast = max_l - min_l
-            # initialize weight then increase when contrast exceeds threshold
-            w = 1.0
-            if contrast > threshold:
-                w = w + multiplier
-            # clamp
-            if w > max_mul:
-                w = max_mul
+                    l = temp_luminance[i + di, j + dj]
+                    gx += l * sobel_kernel_x[di+1, dj+1]
+                    gy += l * sobel_kernel_y[di+1, dj+1]
+            
+            edge_strength[i, j] = ti.sqrt(gx * gx + gy * gy)
+        
+        # 第三步：计算局部方差
+        for i, j in ti.ndrange((1, self.img_res[0]-1), (1, self.img_res[1]-1)):
+            mean = 0.0
+            count = 0
+            
+            # 计算3x3邻域均值
+            for di in ti.static(range(-1, 2)):
+                for dj in ti.static(range(-1, 2)):
+                    mean += temp_luminance[i + di, j + dj]
+                    count += 1
+            mean /= count
+            
+            # 计算方差
+            variance = 0.0
+            for di in ti.static(range(-1, 2)):
+                for dj in ti.static(range(-1, 2)):
+                    diff = temp_luminance[i + di, j + dj] - mean
+                    variance += diff * diff
+            variance /= count
+            
+            local_variance[i, j] = variance
+        
+        # 第四步：结合边缘强度和方差计算最终权重
+        for i, j in ti.ndrange((1, self.img_res[0]-1), (1, self.img_res[1]-1)):
+            # 归一化边缘强度到[0,1]
+            norm_edge = edge_strength[i, j] / (1.0 + edge_strength[i, j])
+            
+            # 归一化方差到[0,1]
+            max_var = 0.1  # 假设最大方差为0.1，可根据场景调整
+            norm_var = ti.min(1.0, local_variance[i, j] / max_var)
+            
+            # 结合边缘和方差特征
+            feature = 0.7 * norm_edge + 0.3 * norm_var
+            
+            # 使用对数函数计算权重，使权重随特征值增加而增加，但增速减缓
+            # 当feature=0时，w=1.0；当feature=1时，w=1+log2(1+max_mul-1)
+            if feature > threshold:
+                # 使用对数函数，使权重增加更加平滑
+                w = 1.0 + ti.log2(1.0 + (max_mul - 1.0) * ((feature - threshold) / (1.0 - threshold)))
+                w = ti.min(w, max_mul)
+            else:
+                w = 1.0
+                
             self.adaptive_weight_map[i, j] = w
 
     def adapt_grid_to_scene(self, spheres: ti.template(), verbose: bool = False):

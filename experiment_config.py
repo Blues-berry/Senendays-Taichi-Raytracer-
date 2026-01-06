@@ -26,7 +26,7 @@ ADAPTIVE_INFLUENCE_RADIUS = 3.0          # Influence radius as multiple of spher
 GAUSSIAN_BLUR_ENABLED = False            # Enable Gaussian blur for weight smoothing
 
 # Grid Settings
-GRID_RESOLUTION = (64, 48, 64)            # Grid resolution (upgraded from 32x32x32)
+GRID_RESOLUTION = (64, 64, 64)            # Grid resolution (upgraded from 32x32x32)
 GRID_PADDING = 1.0                        # Padding around scene AABB
 
 # Adaptive sampling settings (brightness-based)

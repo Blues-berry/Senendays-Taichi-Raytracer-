@@ -35,6 +35,12 @@ class Camera:
         defocus_angle=0.6,
         focus_dist=10.0,
         scene_mode: str = 'random',
+        interpolation_on: bool = True,
+        importance_sampling_on: bool = False,
+        adaptive_logic_on: bool = False,
+        normal_weighting_on: bool = True,
+        distance_weighting_on: bool = True,
+        neighbor_clamping_on: bool = True,
     ):
         # 记录当前场景模式（用于背景色等逻辑）
         self.scene_mode = scene_mode
@@ -47,6 +53,16 @@ class Camera:
         self.max_ray_depth = 500
 
         # Grid / probe tuning (configurable)
+# --- Anti-leaking / interpolation ablation toggles (per Camera instance) ---
+        # These allow benchmark.py ablation groups to actually change behavior.
+        self.interpolate_grid_sampling = bool(interpolation_on)
+        self.enable_light_guided_probes = bool(importance_sampling_on)
+        self.adaptive_logic_on = bool(adaptive_logic_on)
+
+        # Per-instance anti-leak toggles (do NOT rely only on cfg.* statics)
+        self.normal_weighting_enabled = bool(normal_weighting_on)
+        self.distance_weighting_enabled = bool(distance_weighting_on)
+        self.neighbor_clamping_enabled = bool(neighbor_clamping_on)
         self.grid_res = cfg.GRID_RESOLUTION
         self.grid_samples_per_update = 4
         self.grid_probe_depth = 3
@@ -153,18 +169,15 @@ class Camera:
         # large sentinel distance (means "no geometry recorded yet")
         self.grid_mean_distance.fill(1e9)
 
-        # Light source list for importance sampling (populated from Python)
+# Light source list for importance sampling (populated from Python)
         self.max_light_sources = 64
         self.light_count = ti.field(dtype=ti.i32, shape=())
         self.light_centers = ti.Vector.field(n=3, dtype=ti.f32, shape=self.max_light_sources)
         self.light_radii = ti.field(dtype=ti.f32, shape=self.max_light_sources)
         self.light_count[None] = 0
 
-# Feature toggles (controlled by benchmark experiments)
-        # - interpolate_grid_sampling: trilinear (8-probe) sampling vs nearest-probe sampling
-        # - enable_light_guided_probes: occasionally aim probe rays at light sources during grid updates
-        self.interpolate_grid_sampling = True
-        self.enable_light_guided_probes = True
+        # Feature toggles (controlled by benchmark experiments)
+        # (initialized earlier from constructor params)
 
     @ti.kernel
     def render(self, world: ti.template(), mode: ti.i32):
@@ -373,23 +386,23 @@ class Camera:
                     use_probe = False
 
             # Anti-leak mechanism: normal-weighted interpolation
-            if ti.static(cfg.NORMAL_WEIGHTING_ENABLED) and use_probe:
+            if ti.static(self.normal_weighting_enabled) and use_probe:
                 stored_normal = self.normal_grid[ix, iy, iz]
-                if stored_normal.norm() > 1e-6:
+                if stored_normal.norm() > 1e-6 and query_normal.norm() > 1e-6:
                     n_stored = stored_normal.normalized()
-                    n_dot = tm.max(0.0, query_normal.dot(n_stored))
-                    normal_weight = tm.pow(n_dot, 8.0) # Use power of 8 as per instructions
-                    if normal_weight < 0.01:
-                        use_probe = False
-                    else:
-                        w *= normal_weight
+                    qn = query_normal.normalized()
+                    n_dot = tm.max(0.0, qn.dot(n_stored))
+                    normal_weight = tm.pow(n_dot, cfg.NORMAL_POWER)
+                    w *= normal_weight
+                else:
+                    # If we don't have a reliable normal at this cell, reject to avoid leaks
+                    use_probe = False
 
             # Anti-leak mechanism: distance-based weighting
-            if ti.static(cfg.DISTANCE_WEIGHTING_ENABLED) and use_probe:
+            if ti.static(self.distance_weighting_enabled) and use_probe:
                 dist_sq = actual_d * actual_d
-                dist_weight = 1.0 / (dist_sq + 1e-6) # 1/(dist^2 + eps)
-                # Cutoff if too far
-                cutoff = 1.5 * self.grid_cell_size
+                dist_weight = 1.0 / (dist_sq + 1e-4)
+                cutoff = cfg.DISTANCE_CUTOFF_MULTIPLIER * self.grid_cell_size
                 if actual_d > cutoff:
                     dist_weight = 0.0
                 w *= dist_weight
@@ -477,27 +490,23 @@ class Camera:
                 sum_w = ret0.weight + ret1.weight + ret2.weight + ret3.weight + ret4.weight + ret5.weight + ret6.weight + ret7.weight
 
                 if sum_w <= 0.0:
-                    # all probes invalid -> fallback
-                    color = world.materials.albedo[fallback_id]
+                    # all probes invalid -> return 0 to avoid injecting fake light (prevents leaks)
+                    color = vec3(0.0)
                 else:
                     total_color = ret0.color + ret1.color + ret2.color + ret3.color + ret4.color + ret5.color + ret6.color + ret7.color
                     color = total_color / sum_w
 
                     # Anti-leak mechanism: Neighbor Clamping
-                    if ti.static(cfg.NEIGHBOR_CLAMPING_ENABLED):
+                    if ti.static(self.neighbor_clamping_enabled):
                         max_neighbor_irradiance = vec3(0.0)
-                        # Iterate over 3x3x3 neighborhood, excluding the center cell itself
+                        # Include the 8 corners used for interpolation + their 26-neighborhood.
+                        # We clamp each channel by the neighborhood maximum to avoid over-bleeding.
                         for di in ti.static(range(-1, 2)):
                             for dj in ti.static(range(-1, 2)):
                                 for dk in ti.static(range(-1, 2)):
-                                    if not (di == 0 and dj == 0 and dk == 0):
-                                        ni, nj, nk = ix0 + di, iy0 + dj, iz0 + dk
-                                        # Check bounds
-                                        if 0 <= ni < nx and 0 <= nj < ny and 0 <= nk < nz:
-                                            neighbor_val = self.irradiance_grid[ni, nj, nk]
-                                            max_neighbor_irradiance = tm.max(max_neighbor_irradiance, neighbor_val)
-
-                        # Clamp the final color to the max of the neighbors
+                                    ni, nj, nk = ix0 + di, iy0 + dj, iz0 + dk
+                                    if 0 <= ni < nx and 0 <= nj < ny and 0 <= nk < nz:
+                                        max_neighbor_irradiance = tm.max(max_neighbor_irradiance, self.irradiance_grid[ni, nj, nk])
                         color = tm.min(color, max_neighbor_irradiance)
         else:
             # Baseline: nearest-probe sampling
@@ -1078,46 +1087,46 @@ class Camera:
     @ti.func
     def rgb_to_luminance(self, color: vec3) -> ti.f32:
         return 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2]
-        
+
     @ti.kernel
     def compute_adaptive_weights(self, threshold: ti.f32, multiplier: ti.f32, max_mul: ti.f32):
         # 临时场用于存储中间计算结果
         temp_luminance = ti.field(dtype=ti.f32, shape=self.img_res)
         edge_strength = ti.field(dtype=ti.f32, shape=self.img_res)
         local_variance = ti.field(dtype=ti.f32, shape=self.img_res)
-        
+
         # 第一步：计算亮度图
         for i, j in self.frame:
             temp_luminance[i, j] = self.rgb_to_luminance(self.frame[i, j])
-        
+
         # 第二步：使用Sobel算子计算边缘强度
         sobel_kernel_x = ti.Matrix([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
         sobel_kernel_y = ti.Matrix([[-1, -2, -1], [0, 0, 0], [1, 2, 1]])
-        
+
         for i, j in ti.ndrange((1, self.img_res[0]-1), (1, self.img_res[1]-1)):
             gx = 0.0
             gy = 0.0
-            
+
             for di in ti.static(range(-1, 2)):
                 for dj in ti.static(range(-1, 2)):
                     l = temp_luminance[i + di, j + dj]
                     gx += l * sobel_kernel_x[di+1, dj+1]
                     gy += l * sobel_kernel_y[di+1, dj+1]
-            
+
             edge_strength[i, j] = ti.sqrt(gx * gx + gy * gy)
-        
+
         # 第三步：计算局部方差
         for i, j in ti.ndrange((1, self.img_res[0]-1), (1, self.img_res[1]-1)):
             mean = 0.0
             count = 0
-            
+
             # 计算3x3邻域均值
             for di in ti.static(range(-1, 2)):
                 for dj in ti.static(range(-1, 2)):
                     mean += temp_luminance[i + di, j + dj]
                     count += 1
             mean /= count
-            
+
             # 计算方差
             variance = 0.0
             for di in ti.static(range(-1, 2)):
@@ -1125,21 +1134,21 @@ class Camera:
                     diff = temp_luminance[i + di, j + dj] - mean
                     variance += diff * diff
             variance /= count
-            
+
             local_variance[i, j] = variance
-        
+
         # 第四步：结合边缘强度和方差计算最终权重
         for i, j in ti.ndrange((1, self.img_res[0]-1), (1, self.img_res[1]-1)):
             # 归一化边缘强度到[0,1]
             norm_edge = edge_strength[i, j] / (1.0 + edge_strength[i, j])
-            
+
             # 归一化方差到[0,1]
             max_var = 0.1  # 假设最大方差为0.1，可根据场景调整
             norm_var = ti.min(1.0, local_variance[i, j] / max_var)
-            
+
             # 结合边缘和方差特征
             feature = 0.7 * norm_edge + 0.3 * norm_var
-            
+
             # 使用对数函数计算权重，使权重随特征值增加而增加，但增速减缓
             # 当feature=0时，w=1.0；当feature=1时，w=1+log2(1+max_mul-1)
             if feature > threshold:
@@ -1148,7 +1157,7 @@ class Camera:
                 w = ti.min(w, max_mul)
             else:
                 w = 1.0
-                
+
             self.adaptive_weight_map[i, j] = w
 
     def adapt_grid_to_scene(self, spheres: ti.template(), verbose: bool = False):
@@ -1210,17 +1219,21 @@ class Camera:
         dy = max_y - min_y
         dz = max_z - min_z
 
-        # choose cell size so that largest dimension fits grid resolution
+        # choose a *cubic* cell size that guarantees the AABB fits in all axes
+        # This avoids under-resolution / stretching when grid_res is non-uniform.
         nx = self.grid_res[0]
         ny = self.grid_res[1]
         nz = self.grid_res[2]
-        max_dim = dx
-        if dy > max_dim:
-            max_dim = dy
-        if dz > max_dim:
-            max_dim = dz
 
-        cell = max_dim / float(max(nx, ny, nz))
+        # Per-axis cell sizes required to cover the scene
+        cell_x = dx / float(nx) if nx > 0 else 1.0
+        cell_y = dy / float(ny) if ny > 0 else 1.0
+        cell_z = dz / float(nz) if nz > 0 else 1.0
+
+        # Use the maximum to force cubic cells and guarantee coverage
+        cell = max(cell_x, cell_y, cell_z)
+        if cell <= 1e-9:
+            cell = 1.0
 
         # set origin to min corner
         self.grid_origin = vec3(min_x, min_y, min_z)
@@ -1246,6 +1259,9 @@ class Camera:
         self.normal_grid.fill(0.0)
         self.irradiance_mean_lum.fill(0.0)
         self.irradiance_variance.fill(0.0)
+        self.grid_mean_distance.fill(1e9)
+        # reset update weights (important for adaptive logic experiments)
+        self.grid_update_weight.fill(1.0)
         self.grid_mean_distance.fill(1e9)
         self.grid_update_weight.fill(1.0)
         self.accum_frame.fill(0.0)

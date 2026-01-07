@@ -23,7 +23,16 @@ materials = []
 # 当前场景模式：'random', 'cornell_box', 'night_scene', 'two_room', 'classroom', 'bathroom', 'veach_mis'
 CURRENT_SCENE = 'random'
 
-def setup_scene(mode: str = 'random'):
+def setup_scene(
+    mode: str = 'random',
+    *,
+    interpolation_on=None,
+    importance_sampling_on=None,
+    adaptive_logic_on=None,
+    normal_weighting_on=None,
+    distance_weighting_on=None,
+    neighbor_clamping_on=None,
+):
     """根据 mode 构造场景，并返回 (world, cam)。
 
     支持：
@@ -48,7 +57,23 @@ def setup_scene(mode: str = 'random'):
     spheres, materials, cam_params = get_scene(mode)
 
     world = World(spheres, materials)
-    cam = Camera(world, **cam_params)
+    # Prepare ablation-specific camera parameters, filtering out any that were not passed
+    ablation_params = {
+        "interpolation_on": interpolation_on,
+        "importance_sampling_on": importance_sampling_on,
+        "adaptive_logic_on": adaptive_logic_on,
+        "normal_weighting_on": normal_weighting_on,
+        "distance_weighting_on": distance_weighting_on,
+        "neighbor_clamping_on": neighbor_clamping_on,
+    }
+    # Only include parameters that were explicitly passed to setup_scene, allowing Camera defaults
+    final_ablation_params = {k: v for k, v in ablation_params.items() if v is not None}
+
+    # Merge scene parameters with ablation parameters
+    # Ablation parameters will override any conflicting keys from scene_params
+    final_cam_params = {**cam_params, **final_ablation_params}
+
+    cam = Camera(world, **final_cam_params)
 
     print(f"Initializing scene: {mode}")
     cam.adapt_grid_to_scene(spheres, verbose=True)
@@ -133,9 +158,8 @@ def main():
             # If any big sphere moved, clear grids and re-adapt bounds
             if len(moved_indices) > 0:
                 print(f"Frame {rendered_frames}: Large sphere moved, clearing grids and re-adapting...")
-                # Clear old cache to prevent ghosting/leaking
-                cam.irradiance_grid.fill(0.0)
-                cam.normal_grid.fill(0.0)
+                cam.clear_grid_data()
+                # Optional: re-adapt if AABB changed significantly
                 cam.adapt_grid_to_scene(spheres, verbose=True)
 
         # Reset weights to 1.0 using Taichi field fill (avoids expensive Python loops)
@@ -225,6 +249,7 @@ def main():
                 spheres[idx].center[0] = spheres[idx].center[0] + 0.5
                 prev_centers[0] = spheres[idx].center
                 print(f"[Move] Frame {rendered_frames}: moved big sphere {idx} by +0.5 on X")
+                cam.clear_grid_data()
                 cam.adapt_grid_to_scene(spheres, verbose=True)
                 move_count += 1
                 last_move_frame = rendered_frames

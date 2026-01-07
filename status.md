@@ -1,35 +1,70 @@
-你的目标：在当前 Taichi hybrid irradiance grid path tracer 的基础上，通过针对性优化大幅减少漏光（light leaking），使渲染质量在低样本数（≤8 spp）下接近参考路径追踪，同时保持实时性能（≥30 FPS @ 1200x675），为发表论文准备高质量结果。
+请按照以下优先级和具体要求，逐步修改现有代码，重点解决渲染质量（尤其是漏光）和逻辑一致性问题。目标是让渲染结果在低样本数下接近参考路径追踪，同时为 ablation 实验提供可信的结果。
+优先级 1：立即修复防漏光机制（最关键）
+当前防漏光开关（NORMAL_WEIGHTING_ENABLED、DISTANCE_WEIGHTING_ENABLED、NEIGHBOR_CLAMPING_ENABLED）在 experiment_config.py 中已定义，但 camera.py 中并未实际使用，导致漏光问题严重。
+任务：
 
-优先级顺序（必须严格遵守）：
+在 Camera 类的 __init__ 中添加缺失的 field：Pythonself.normal_grid = ti.Vector.field(3, ti.f32, shape=self.grid_res)
+修改或替换当前的 irradiance 采样函数（sample_irradiance_grid 或类似函数），实现带权重的插值：
+支持以下三种权重（根据配置开关启用）：
+法线权重：pow(max(dot(cell_normal, query_normal), 0.0), cfg.NORMAL_POWER)
+距离权重：1.0 / (dist * dist + 1e-4)，若 dist > cfg.DISTANCE_CUTOFF_MULTIPLIER * self.grid_cell_size 则权重为 0
+邻域钳制（Neighbor Clamping）：最终 irradiance 值不得超过周围 26 个邻域 cell 的最大值
 
-1. **最高优先：彻底解决漏光问题（视觉质量决定论文成败）**
-   - 立即实现以下三项防漏光机制（任选其二即可见效，全做最佳）：
-     a. **法线加权插值（Normal-weighted interpolation）**：新增一个 normal_grid (vec3, same shape as irradiance_grid)，在探针更新时累加击中表面的法线。在三线性采样 irradiance 时，对每个邻域 cell 计算 normal.dot(query_normal)^8 作为权重，仅信任法线一致的 cell。
-     b. **距离加权 + 阈值截断**：采样时计算 query_pos 到 cell_center 的距离，使用 1/(dist² + ε) 权重，并如果距离 > 1.5 × cell_size 则权重设为 0。
-     c. **Neighbor Clamping（可选进阶）**：采样得到的 irradiance 值不得超过周围 26 个邻域 cell 的最大值（经典 radiance caching 防漏光技巧）。
-   - 物体移动后必须立即 cam.irradiance_grid.fill(0.0) 和 normal_grid.fill(0.0)，防止旧缓存残留导致鬼影/漏光。
+权重归一化后计算加权平均
+如果所有权重都为 0，则返回零或背景色
 
-2. **次高优先：提升有效分辨率但控制内存与性能**
-   - 将 grid_res 从 (32,32,32) 提升到 (64,48,64) 或 (64,64,64)，同时保持 GRID_PADDING ≥ 1.0。
-   - 若显存/性能紧张，可改为非均匀 grid（如 xz 方向更高分辨率）。
+在 experiment_config.py 中添加对应的 Camera 属性（或通过参数传递）：Pythonself.normal_weighting_enabled = cfg.NORMAL_WEIGHTING_ENABLED
+self.distance_weighting_enabled = cfg.DISTANCE_WEIGHTING_ENABLED
+self.neighbor_clamping_enabled = cfg.NEIGHBOR_CLAMPING_ENABLED
 
-3. **创新点强化（论文差异化关键）**
-   - 保留并突出当前三项可开关组件：
-     • Tri-linear interpolation (interpolation_on)
-     • Light-guided probes / importance sampling (importance_sampling_on)
-     • Adaptive weight update (adaptive_logic_on)
-   - 在 ablation 中新增一组：只开 normal-weighted interpolation 的变体，证明其对漏光抑制的独立贡献。
-   - 强调“零预计算、自动 grid 适应、动态场景下 <50 帧完全恢复”的轻量优势，与需要重预计算的 neural caching、wavelet caching 方法形成鲜明对比。
+优先级 2：物体移动后必须清除 grid 数据
+当前 adapt_grid_to_scene 只在初始化时调用，物体移动后旧缓存数据残留，导致鬼影和持续漏光。
+任务：
 
-4. **性能约束**
-   - 所有优化后，Cornell Box 场景在单张 RTX 3060/4070 上必须保持 ≥30 FPS（含 GUI）。
-   - 禁止引入神经网络、额外 BVH、复杂数据结构（如 octree、wavelets），保持纯 Taichi field + kernel 的轻量实现。
+在 main.py 的交互循环中，物体移动（move_big_spheres 或类似逻辑）后，立即调用：Pythoncam.clear_grid_data()
+# 可选：cam.adapt_grid_to_scene(spheres, verbose=False)  # 如果需要重新计算 AABB
+确保 clear_grid_data 方法清除所有相关 field，包括：Pythonself.irradiance_grid.fill(0.0)
+self.normal_grid.fill(0.0)
+self.grid_update_weight.fill(1.0)
+# 根据实际使用的其他统计 field 也一并清零
 
-5. **输出要求**
-   - 修复后立即运行 benchmark.py（scene='cornell_box'），生成：
-     • 修复前 vs 修复后对比截图（frame 50、move+5、move+50）
-     • MSE 曲线（log scale，四组 ablation）
-     • 误差热图（尤其突出阴影边缘和颜色出血区域的改善）
-   - 如果漏光基本消失、MSE 显著下降（Full_Hybrid < 1e-3）、视觉接近 256 spp PT 参考，即可停止优化，开始准备论文图表。
+优先级 3：将 ablation 开关正确传递给 Camera
+当前 benchmark.py 定义了 ablation 组（包括 normal_weighting_on），但 Camera 没有接收这些开关，导致 ablation 实验无法区分不同配置的效果。
+任务：
 
-请按以上顺序逐步实现，每完成一项立即测试视觉效果并报告。目标是让审稿人看到截图时认为“这是干净的实时路径追踪结果”，而不是“明显的 grid caching 伪影”。
+修改 Camera 的构造函数，增加参数：Pythondef __init__(self, world, ..., interpolation_on=True, importance_sampling_on=False,
+             adaptive_logic_on=False, normal_weighting_on=False, ...):
+    self.interpolation_on = interpolation_on
+    self.importance_sampling_on = importance_sampling_on
+    self.adaptive_logic_on = adaptive_logic_on
+    self.normal_weighting_on = normal_weighting_on
+    # ... 其他开关
+在渲染相关函数中，根据这些开关控制行为，例如：
+是否使用三线性插值
+是否使用光源引导探针
+是否启用自适应权重更新
+是否启用 normal weighting 等防漏光机制
+
+在 main.py 或 benchmark 脚本中创建 Camera 时，传入对应组的开关值。
+
+优先级 4：其他小问题修复
+
+非均匀 grid_res 的 cell size 计算
+当前 adapt_grid_to_scene 使用单一 cell = max_dim / max(nx,ny,nz)，可能导致某些方向分辨率不足。
+建议：改为分别计算每个方向的 cell size，或强制使用立方体 cell（取最大边长）。
+缺少 max_light_sources 定义
+在 set_light_sources 中使用 maxl = int(self.max_light_sources)，但未定义。
+修复：在 __init__ 中添加：Pythonself.max_light_sources = 64
+场景配置导入问题main.py 中有 from scenes.scene_configs import get_scene，但未提供该模块。
+建议：暂时注释掉，或补全该模块；若不使用，可直接在 setup_scene 中保留手动场景构建逻辑。
+
+优先级 5：验证与输出要求
+完成以上修改后，请执行以下步骤并报告结果：
+
+在 cornell_box 场景下运行基准测试（benchmark.py），比较开启/关闭 normal weighting 的视觉差异。
+保存修复前后在物体移动后第 5 帧和第 50 帧的截图 + 误差热图。
+检查 MSE 曲线是否显著改善（尤其 Full_Hybrid 组）。
+确认性能是否仍在实时范围内（目标 ≥ 30 FPS）。
+
+目标：修复后渲染画面应明显减少漏光、颜色出血和鬼影，阴影边缘更清晰，整体接近参考路径追踪效果。
+请按以上顺序逐项完成，每完成一项可简要报告进展或遇到的问题。完成后可继续优化性能或增加更多场景支持。

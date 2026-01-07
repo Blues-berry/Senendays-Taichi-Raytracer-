@@ -178,31 +178,27 @@ def plot_mse_curves(mse_by_group, out_path, title):
 
 
 def _apply_ablation_toggles(group_cfg: dict):
-    """Apply ablation toggles to the camera + global experiment config.
+    # NOTE: 该函数已不再是“必要步骤”，因为我们现在在创建 Camera 时就把 ablation 参数传入。
+    # 仍保留此函数以兼容旧调用/调试（例如运行中临时切换）。
+    """将 ablation 开关应用到 *当前 Camera 实例*。
 
-    This benchmark expects camera.py to expose:
-      - cam.interpolate_grid_sampling
-      - cam.enable_light_guided_probes
+    重要：Taichi 里 `ti.static(cfg.SWITCH)` 往往会在编译期静态化，运行时修改 cfg
+    可能不会生效，导致 ablation 结果不可信。
 
-    Adaptive logic is controlled in this benchmark by whether we call
-    cam.compute_adaptive_weights() each frame.
-
-    Anti-leak mechanisms are controlled via experiment_config (cfg.*):
-      - NORMAL_WEIGHTING_ENABLED
-      - DISTANCE_WEIGHTING_ENABLED
-      - NEIGHBOR_CLAMPING_ENABLED
-
-    IMPORTANT: These must be independently switchable for a rigorous ablation.
+    因此本 benchmark 统一改为：
+    - 通过 Camera 实例字段控制（cam.xxx_enabled / cam.interpolate_grid_sampling 等）
+    - 仅在创建 Camera 时/每组重建 Camera 后设置一次
     """
     cam.interpolate_grid_sampling = bool(group_cfg.get("interpolation_on", False))
     cam.enable_light_guided_probes = bool(group_cfg.get("importance_sampling_on", False))
 
-    import experiment_config as cfg
+    # 实例级 anti-leak 开关（camera.py 已改为使用这些字段）
+    cam.normal_weighting_enabled = bool(group_cfg.get("normal_weighting_on", False))
+    cam.distance_weighting_enabled = bool(group_cfg.get("distance_weighting_on", False))
+    cam.neighbor_clamping_enabled = bool(group_cfg.get("neighbor_clamping_on", False))
 
-    # Independent anti-leak toggles
-    cfg.NORMAL_WEIGHTING_ENABLED = bool(group_cfg.get("normal_weighting_on", False))
-    cfg.DISTANCE_WEIGHTING_ENABLED = bool(group_cfg.get("distance_weighting_on", False))
-    cfg.NEIGHBOR_CLAMPING_ENABLED = bool(group_cfg.get("neighbor_clamping_on", False))
+    # 兼容性：不再在这里修改 experiment_config 的全局开关，避免 ti.static 导致的无效切换
+    # 如确实需要全局默认值，请在创建 Camera 时通过参数传入。
 
 
 def _trigger_object_movement_at_frame(frame_idx: int, trigger_frame: int = 200) -> bool:
@@ -293,12 +289,17 @@ def run_group_experiments(scene_mode='cornell_box'):
         group_name = g["name"]
         log_message(f"\n=== Running group {gi+1}/{len(EXPERIMENT_GROUPS)}: {group_name} ===")
 
-        # Re-init scene for fairness (same camera/world setup)
-        world, cam = main.setup_scene(scene_mode)
-        cam.scene_mode = scene_mode
-
-        # Apply feature toggles on camera
-        _apply_ablation_toggles(g)
+        # 在创建 Camera 时直接传入 ablation 参数，而不是创建后修改属性
+        world, cam = main.setup_scene(
+            scene_mode,
+            interpolation_on=g.get("interpolation_on", None),
+            importance_sampling_on=g.get("importance_sampling_on", None),
+            adaptive_logic_on=g.get("adaptive_logic_on", None),
+            normal_weighting_on=g.get("normal_weighting_on", None),
+            distance_weighting_on=g.get("distance_weighting_on", None),
+            neighbor_clamping_on=g.get("neighbor_clamping_on", None),
+        )
+        cam.scene_mode = scene_mode  # 保留场景模式设置
 
         # Ensure the compact light list exists when importance sampling is enabled
         try:

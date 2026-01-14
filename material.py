@@ -105,8 +105,7 @@ class Lambert:
         if utils.near_zero(scatter_direction):
             scatter_direction = record.normal
         scattered = Ray(record.p, scatter_direction)
-        attenuation = albedo
-        return scatter_return(did_scatter=True, attenuation=attenuation, scattered=scattered)
+        return scatter_return(did_scatter=True, attenuation=albedo, scattered=scattered)
 
 class Metal:
     def __init__(self, albedo: vec3, roughness: float):
@@ -120,8 +119,7 @@ class Metal:
     def scatter(ray: Ray, record: hit_record, albedo: vec3, roughness: float) -> scatter_return:
         reflected = utils.reflect(ray.direction.normalized(), record.normal)
         scattered = Ray(record.p, reflected + roughness * utils.random_unit_vector())
-        attenuation = albedo
-        return scatter_return(did_scatter=True, attenuation=attenuation, scattered=scattered)
+        return scatter_return(did_scatter=True, attenuation=albedo, scattered=scattered)
 
 class Dielectric:
     def __init__(self, ior: float):
@@ -133,7 +131,6 @@ class Dielectric:
     @staticmethod
     @ti.func
     def scatter(ray: Ray, record: hit_record, albedo: vec3, ior: float) -> scatter_return:
-        attenuation = albedo
         ri = 1.0 / ior if record.front_face else ior
 
         unit_direction = ray.direction.normalized()
@@ -148,7 +145,7 @@ class Dielectric:
             direction = utils.refract(unit_direction, record.normal, ri)
 
         scattered = Ray(record.p, direction)
-        return scatter_return(did_scatter=True, attenuation=attenuation, scattered=scattered)
+        return scatter_return(did_scatter=True, attenuation=albedo, scattered=scattered)
 
 class DiffuseLight:
     def __init__(self, emit: vec3):

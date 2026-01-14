@@ -904,7 +904,7 @@ class Camera:
     @ti.func
     def step_ray(self, ray: Ray, world: ti.template()) -> ray_return:
         color = vec3(0, 0, 0)
-        hit = world.hit_world(ray, 0.00, tm.inf)
+        hit = world.hit_world(ray, 0.001, tm.inf)
         resulting_ray = Ray()
 
         if hit.did_hit:

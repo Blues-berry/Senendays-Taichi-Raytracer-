@@ -16,7 +16,7 @@ def random_on_hemisphere(normal: vec3) -> vec3:
 @ti.func
 def near_zero(v: vec3) -> bool:
     s = 1e-8
-    return (v[0] < s) and (v[1] < s) and (v[2] < s)
+    return tm.abs(v[0]) < s and tm.abs(v[1]) < s and tm.abs(v[2]) < s
 
 
 def length(v: vec3) -> float:

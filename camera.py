@@ -35,6 +35,7 @@ class Camera:
         defocus_angle=0.6,
         focus_dist=10.0,
         scene_mode: str = 'random',
+        scene_bounds: tuple = None,  # (min_x, min_y, min_z, max_x, max_y, max_z)
         interpolation_on: bool = True,
         importance_sampling_on: bool = False,
         adaptive_logic_on: bool = False,
@@ -139,6 +140,14 @@ class Camera:
         self.adaptive_weight_map = ti.field(dtype=ti.f32, shape=self.img_res)
         self.adaptive_weight_map.fill(1.0)
 
+        # Temporary buffers for compute_adaptive_weights() (must be allocated in Python-scope)
+        self._temp_luminance = ti.field(dtype=ti.f32, shape=self.img_res)
+        self._edge_strength = ti.field(dtype=ti.f32, shape=self.img_res)
+        self._local_variance = ti.field(dtype=ti.f32, shape=self.img_res)
+        self._temp_luminance.fill(0.0)
+        self._edge_strength.fill(0.0)
+        self._local_variance.fill(0.0)
+
         # sampling configuration
         self.base_samples = self.samples_per_pixel
         self.max_samples_per_pixel = max(8, int(self.base_samples * 2))
@@ -148,6 +157,9 @@ class Camera:
         # Define grid origin and cell size (world-space AABB)
         self.grid_origin = vec3(-8.0, -1.0, -8.0)
         self.grid_cell_size = 1.0
+        # Optional: scene-provided logical bounds for grid adaptation
+        # (used to avoid huge AABBs from "wall spheres" in Cornell-style scenes)
+        self.scene_bounds = None
         self.irradiance_grid = ti.Vector.field(n=3, dtype=ti.f32, shape=self.grid_res)
         # Normal grid for anti-leaking (stores accumulated normals at each cell)
         self.normal_grid = ti.Vector.field(n=3, dtype=ti.f32, shape=self.grid_res)
@@ -414,6 +426,86 @@ class Camera:
         return probe_return(color=result_color, weight=result_weight)
 
     @ti.func
+    def sample_irradiance_weighted(self, p: vec3, query_normal: vec3, fallback_id: int, world: ti.template()) -> vec3:
+        """8-neighborhood weighted sampling (trilinear * normal * distance).
+
+        This is the "strict" anti-leak sampler requested by the benchmark spec.
+        """
+        local = p - self.grid_origin
+        fx = local[0] / self.grid_cell_size
+        fy = local[1] / self.grid_cell_size
+        fz = local[2] / self.grid_cell_size
+
+        nx = self.grid_res[0]
+        ny = self.grid_res[1]
+        nz = self.grid_res[2]
+
+        # base cell corner
+        ix0f = ti.floor(fx)
+        iy0f = ti.floor(fy)
+        iz0f = ti.floor(fz)
+        ix0 = int(ix0f)
+        iy0 = int(iy0f)
+        iz0 = int(iz0f)
+
+        # outside or on border -> fallback
+        outside = (ix0 < 0 or ix0 >= nx - 1 or iy0 < 0 or iy0 >= ny - 1 or iz0 < 0 or iz0 >= nz - 1)
+        tx = fx - ix0f
+        ty = fy - iy0f
+        tz = fz - iz0f
+        # Taichi: cannot early-return inside runtime `if`. Use a flag.
+        fallback_col = world.materials.albedo[fallback_id]
+        # Taichi restriction: avoid `return` inside runtime control flow.
+        if outside:
+            col_out = fallback_col
+        else:
+            col_out = vec3(0.0)
+
+            total = vec3(0.0)
+            total_w = 0.0
+
+            # normalize query normal once
+            qn = query_normal
+            if qn.norm() > 1e-6:
+                qn = qn.normalized()
+
+            for di in ti.static(range(2)):
+                for dj in ti.static(range(2)):
+                    for dk in ti.static(range(2)):
+                        ix = ix0 + di
+                        iy = iy0 + dj
+                        iz = iz0 + dk
+
+                        # trilinear weight
+                        wx = tx if di == 1 else (1.0 - tx)
+                        wy = ty if dj == 1 else (1.0 - ty)
+                        wz = tz if dk == 1 else (1.0 - tz)
+                        w = wx * wy * wz
+
+                        # reuse existing per-probe validity + normal/distance weighting
+                        pr = self._probe_contrib(p, ix, iy, iz, w, qn)
+                        col_out += pr.color
+                        total_w += pr.weight
+
+            if total_w > 1e-8:
+                col_out = col_out / total_w
+            else:
+                col_out = vec3(0.0)
+
+            # neighbor clamping (same behavior as existing trilinear path)
+            if ti.static(self.neighbor_clamping_enabled):
+                max_neighbor_irradiance = vec3(0.0)
+                for di in ti.static(range(-1, 2)):
+                    for dj in ti.static(range(-1, 2)):
+                        for dk in ti.static(range(-1, 2)):
+                            ni, nj, nk = ix0 + di, iy0 + dj, iz0 + dk
+                            if 0 <= ni < nx and 0 <= nj < ny and 0 <= nk < nz:
+                                max_neighbor_irradiance = tm.max(max_neighbor_irradiance, self.irradiance_grid[ni, nj, nk])
+                col_out = tm.min(col_out, max_neighbor_irradiance)
+
+        return col_out
+
+    @ti.func
     def sample_irradiance_grid(self, p: vec3, world: ti.template(), fallback_id: int, normal: vec3) -> vec3:
         """Sample the irradiance grid.
 
@@ -431,6 +523,10 @@ class Camera:
         nz = self.grid_res[2]
 
         color = vec3(0.0)
+
+        # If any anti-leak weighting is enabled, use the strict weighted 8-neighborhood sampler.
+        if ti.static(self.normal_weighting_enabled or self.distance_weighting_enabled):
+            return self.sample_irradiance_weighted(p, normal, fallback_id, world)
 
         if self.interpolate_grid_sampling:
             # integer base indices (cell corner)
@@ -1090,130 +1186,104 @@ class Camera:
 
     @ti.kernel
     def compute_adaptive_weights(self, threshold: ti.f32, multiplier: ti.f32, max_mul: ti.f32):
-        # 临时场用于存储中间计算结果
-        temp_luminance = ti.field(dtype=ti.f32, shape=self.img_res)
-        edge_strength = ti.field(dtype=ti.f32, shape=self.img_res)
-        local_variance = ti.field(dtype=ti.f32, shape=self.img_res)
+        """Update per-pixel adaptive sampling weights.
 
-        # 第一步：计算亮度图
+        NOTE: This kernel must not allocate Taichi fields inside (Taichi-scope).
+        Temporary buffers are stored as fields on the Camera instance.
+        """
+        # Step 1: luminance
         for i, j in self.frame:
-            temp_luminance[i, j] = self.rgb_to_luminance(self.frame[i, j])
+            self._temp_luminance[i, j] = self.rgb_to_luminance(self.frame[i, j])
 
-        # 第二步：使用Sobel算子计算边缘强度
+        # Step 2: Sobel edge strength
         sobel_kernel_x = ti.Matrix([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
         sobel_kernel_y = ti.Matrix([[-1, -2, -1], [0, 0, 0], [1, 2, 1]])
 
-        for i, j in ti.ndrange((1, self.img_res[0]-1), (1, self.img_res[1]-1)):
+        for i, j in ti.ndrange((1, self.img_res[0] - 1), (1, self.img_res[1] - 1)):
             gx = 0.0
             gy = 0.0
-
             for di in ti.static(range(-1, 2)):
                 for dj in ti.static(range(-1, 2)):
-                    l = temp_luminance[i + di, j + dj]
-                    gx += l * sobel_kernel_x[di+1, dj+1]
-                    gy += l * sobel_kernel_y[di+1, dj+1]
+                    l = self._temp_luminance[i + di, j + dj]
+                    gx += l * sobel_kernel_x[di + 1, dj + 1]
+                    gy += l * sobel_kernel_y[di + 1, dj + 1]
+            self._edge_strength[i, j] = ti.sqrt(gx * gx + gy * gy)
 
-            edge_strength[i, j] = ti.sqrt(gx * gx + gy * gy)
-
-        # 第三步：计算局部方差
-        for i, j in ti.ndrange((1, self.img_res[0]-1), (1, self.img_res[1]-1)):
+        # Step 3: local variance (3x3)
+        for i, j in ti.ndrange((1, self.img_res[0] - 1), (1, self.img_res[1] - 1)):
             mean = 0.0
             count = 0
-
-            # 计算3x3邻域均值
             for di in ti.static(range(-1, 2)):
                 for dj in ti.static(range(-1, 2)):
-                    mean += temp_luminance[i + di, j + dj]
+                    mean += self._temp_luminance[i + di, j + dj]
                     count += 1
             mean /= count
 
-            # 计算方差
-            variance = 0.0
+            var = 0.0
             for di in ti.static(range(-1, 2)):
                 for dj in ti.static(range(-1, 2)):
-                    diff = temp_luminance[i + di, j + dj] - mean
-                    variance += diff * diff
-            variance /= count
+                    d = self._temp_luminance[i + di, j + dj] - mean
+                    var += d * d
+            var /= count
+            self._local_variance[i, j] = var
 
-            local_variance[i, j] = variance
-
-        # 第四步：结合边缘强度和方差计算最终权重
-        for i, j in ti.ndrange((1, self.img_res[0]-1), (1, self.img_res[1]-1)):
-            # 归一化边缘强度到[0,1]
-            norm_edge = edge_strength[i, j] / (1.0 + edge_strength[i, j])
-
-            # 归一化方差到[0,1]
-            max_var = 0.1  # 假设最大方差为0.1，可根据场景调整
-            norm_var = ti.min(1.0, local_variance[i, j] / max_var)
-
-            # 结合边缘和方差特征
+        # Step 4: combine -> adaptive weight map
+        for i, j in ti.ndrange((1, self.img_res[0] - 1), (1, self.img_res[1] - 1)):
+            norm_edge = self._edge_strength[i, j] / (1.0 + self._edge_strength[i, j])
+            max_var = 0.1
+            norm_var = ti.min(1.0, self._local_variance[i, j] / max_var)
             feature = 0.7 * norm_edge + 0.3 * norm_var
 
-            # 使用对数函数计算权重，使权重随特征值增加而增加，但增速减缓
-            # 当feature=0时，w=1.0；当feature=1时，w=1+log2(1+max_mul-1)
+            # IMPORTANT (Taichi-scope rule): define variables before branching.
+            # Otherwise Taichi may treat them as undefined outside the branch.
+            w = 1.0
             if feature > threshold:
-                # 使用对数函数，使权重增加更加平滑
-                w = 1.0 + ti.log2(1.0 + (max_mul - 1.0) * ((feature - threshold) / (1.0 - threshold)))
+                # Taichi 1.7.x doesn't expose ti.log2 on some builds; use ln(x)/ln(2).
+                w = 1.0 + ti.log(1.0 + (max_mul - 1.0) * ((feature - threshold) / (1.0 - threshold))) / 0.6931471805599453
                 w = ti.min(w, max_mul)
-            else:
-                w = 1.0
 
             self.adaptive_weight_map[i, j] = w
 
-    def adapt_grid_to_scene(self, spheres: ti.template(), verbose: bool = False):
+    def adapt_grid_to_scene(self, spheres: ti.template(), verbose: bool = False, scene_bounds=None):
         """
         Automatically compute and adapt the irradiance grid to tightly fit the scene AABB.
 
         Args:
             spheres: List of Sphere objects in the scene
             verbose: If True, print diagnostic information about the grid adaptation
+            scene_bounds: Optional tuple of (min_x, min_y, min_z, max_x, max_y, max_z) to override AABB
         """
-        # Compute scene AABB from sphere centers and radii (Python-side)
-        # spheres is a Python list of Sphere objects
-        # find min and max
-        first = True
-        min_x = 0.0
-        min_y = 0.0
-        min_z = 0.0
-        max_x = 0.0
-        max_y = 0.0
-        max_z = 0.0
-        for s in spheres:
-            c = s.center
-            r = s.radius
-            cx = float(c[0])
-            cy = float(c[1])
-            cz = float(c[2])
-            if first:
-                min_x = cx - r
-                min_y = cy - r
-                min_z = cz - r
-                max_x = cx + r
-                max_y = cy + r
-                max_z = cz + r
-                first = False
-            else:
-                if cx - r < min_x:
-                    min_x = cx - r
-                if cy - r < min_y:
-                    min_y = cy - r
-                if cz - r < min_z:
-                    min_z = cz - r
-                if cx + r > max_x:
-                    max_x = cx + r
-                if cy + r > max_y:
-                    max_y = cy + r
-                if cz + r > max_z:
-                    max_z = cz + r
+        if scene_bounds is not None:
+            # Use provided scene bounds if available (e.g., for Cornell Box with large wall spheres)
+            min_x, min_y, min_z, max_x, max_y, max_z = scene_bounds
+        else:
+            # Fall back to computing AABB from spheres
+            first = True
+            min_x = min_y = min_z = max_x = max_y = max_z = 0.0
+            for s in spheres:
+                c = s.center
+                r = s.radius
+                cx, cy, cz = float(c[0]), float(c[1]), float(c[2])
+                if first:
+                    min_x, min_y, min_z = cx - r, cy - r, cz - r
+                    max_x, max_y, max_z = cx + r, cy + r, cz + r
+                    first = False
+                else:
+                    min_x = min(min_x, cx - r)
+                    min_y = min(min_y, cy - r)
+                    min_z = min(min_z, cz - r)
+                    max_x = max(max_x, cx + r)
+                    max_y = max(max_y, cy + r)
+                    max_z = max(max_z, cz + r)
 
-        # pad slightly to avoid boundary issues
-        pad = cfg.GRID_PADDING
-        min_x -= pad
-        min_y -= pad
-        min_z -= pad
-        max_x += pad
-        max_y += pad
-        max_z += pad
+            # Add padding to avoid boundary issues
+            pad = cfg.GRID_PADDING
+            min_x -= pad
+            min_y -= pad
+            min_z -= pad
+            max_x += pad
+            max_y += pad
+            max_z += pad
 
         dx = max_x - min_x
         dy = max_y - min_y

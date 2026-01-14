@@ -21,7 +21,9 @@ spheres = []
 materials = []
 
 # 当前场景模式：'random', 'cornell_box', 'night_scene', 'two_room', 'classroom', 'bathroom', 'veach_mis'
-CURRENT_SCENE = 'random'
+# NOTE: Do NOT initialize the scene at import time; benchmarks import main.py.
+# The scene must be constructed explicitly in __main__ or benchmark runners.
+DEFAULT_SCENE = 'cornell_box'
 
 def setup_scene(
     mode: str = 'random',
@@ -75,8 +77,14 @@ def setup_scene(
 
     cam = Camera(world, **final_cam_params)
 
+    # Store scene_bounds on camera for downstream scripts (ablation/benchmark) to reuse
+    if 'scene_bounds' in cam_params:
+        cam.scene_bounds = cam_params['scene_bounds']
+
     print(f"Initializing scene: {mode}")
-    cam.adapt_grid_to_scene(spheres, verbose=True)
+    # Prefer scene-provided logical bounds to avoid huge AABB from "wall spheres".
+    scene_bounds = cam_params.get('scene_bounds', None)
+    cam.adapt_grid_to_scene(spheres, verbose=True, scene_bounds=scene_bounds)
     # Populate camera-side light source list for importance sampling (NEE)
     cam.set_light_sources(spheres, materials)
 
@@ -91,8 +99,10 @@ def setup_scene(
     return world, cam
 
 
-# 初始化场景
-world, cam = setup_scene(CURRENT_SCENE)
+# IMPORTANT: Scene must NOT be initialized at import time.
+# `world` / `cam` will be created in __main__ or by benchmark scripts.
+world = None
+cam = None
 
 # Experiment control
 # options: 'PT', 'Grid', 'Adaptive', 'ERROR'
@@ -336,4 +346,22 @@ def average_frames(current_frame: ti.template(), new_frame: ti.template(), weigh
 
 
 if __name__ == '__main__':
+    import argparse
+
+    # Set up command line argument parsing
+    parser = argparse.ArgumentParser(description='Taichi Hybrid Path Tracer')
+    parser.add_argument('--scene', type=str, default=DEFAULT_SCENE,
+                       help='Scene to render (cornell_box, two_room, night_scene, random, classroom, bathroom, veach_mis)')
+    parser.add_argument('--mode', type=str, default='ERROR',
+                       help='Rendering mode (PT, Grid, Adaptive, ERROR)')
+
+    args = parser.parse_args()
+
+    # Initialize scene with specified parameters
+    world, cam = setup_scene(args.scene)
+
+    # Set render mode if specified
+    if args.mode in mode_map:
+        render_mode = args.mode
+
     main()

@@ -27,47 +27,57 @@ def create_cornell_box_scene():
     left_red = vec3(0.65, 0.05, 0.05)
     right_green = vec3(0.12, 0.45, 0.15)
 
-    # Cornell Box 参数
-    half = 2.75
-    R = 1000.0  # 大球半径（越接近平面）
+    # Cornell Box 参数（标准单位尺度，避免 AABB 过大导致 grid 失效）
+    # Room extends roughly to [-half, +half] in X/Y and [-2*half, 0] in Z.
+    half = 1.0
+    wall_radius = 100.0  # 足够大近似平面，但不会让 AABB 膨胀到几千
 
     # === 五面墙（没有前墙，便于相机观察） ===
-    # 左墙（红）/ 右墙（绿）
-    spheres.append(Sphere(center=vec3(-(R + half), 0.0, 0.0), radius=R))
+    # We build planes via large spheres placed outside the box.
+    # Left wall (red): x = -half
+    spheres.append(Sphere(center=vec3(-(wall_radius + half), 0.0, -half), radius=wall_radius))
     materials.append(material.Lambert(left_red))
-    spheres.append(Sphere(center=vec3((R + half), 0.0, 0.0), radius=R))
+
+    # Right wall (green): x = +half
+    spheres.append(Sphere(center=vec3((wall_radius + half), 0.0, -half), radius=wall_radius))
     materials.append(material.Lambert(right_green))
 
-    # 地面 / 天花板 / 后墙（白）
-    spheres.append(Sphere(center=vec3(0.0, -(R + half), 0.0), radius=R))
-    materials.append(material.Lambert(white))
-    spheres.append(Sphere(center=vec3(0.0, (R + half), 0.0), radius=R))
-    materials.append(material.Lambert(white))
-    spheres.append(Sphere(center=vec3(0.0, 0.0, -(R + half)), radius=R))
+    # Floor: y = -half
+    spheres.append(Sphere(center=vec3(0.0, -(wall_radius + half), -half), radius=wall_radius))
     materials.append(material.Lambert(white))
 
-    # === 顶部面光源（用一个较大的发光球近似平面光源） ===
-    spheres.append(Sphere(center=vec3(0.0, half - 0.15, -1.0), radius=0.85))
+    # Ceiling: y = +half
+    spheres.append(Sphere(center=vec3(0.0, (wall_radius + half), -half), radius=wall_radius))
+    materials.append(material.Lambert(white))
+
+    # Back wall: z = -2*half
+    spheres.append(Sphere(center=vec3(0.0, 0.0, -(wall_radius + 2.0 * half)), radius=wall_radius))
+    materials.append(material.Lambert(white))
+
+    # === 顶部面光源（小发光球近似面光源，置于天花板下方） ===
+    spheres.append(Sphere(center=vec3(0.0, half - 0.05, -half - 0.35), radius=0.25))
     materials.append(material.DiffuseLight(vec3(25.0, 25.0, 25.0)))
 
-    # === 盒内两球 ===
-    # 高反射金属球（低 fuzz）
-    spheres.append(Sphere(center=vec3(-0.85, -half + 0.70, -1.65), radius=0.70))
+    # === 盒内两球（标准大小） ===
+    spheres.append(Sphere(center=vec3(-0.35, -half + 0.30, -half - 0.95), radius=0.30))
     materials.append(material.Metal(vec3(0.93, 0.93, 0.93), 0.01))
 
-    # 折射玻璃球
-    spheres.append(Sphere(center=vec3(0.95, -half + 0.70, -0.95), radius=0.70))
+    spheres.append(Sphere(center=vec3(0.35, -half + 0.30, -half - 0.55), radius=0.30))
     materials.append(material.Dielectric(1.5))
 
-    # 相机参数
+    # 相机参数（贴近 Cornell Box 常用视角）
+    # Provide a *logical* scene AABB for grid adaptation (avoid huge AABB from wall spheres).
+    # Room approx: x,y in [-half, half], z in [-2*half, 0]
+    pad = 0.1
     cam_params = dict(
-        lookfrom=vec3(0.0, 0.0, 8.5),
-        lookat=vec3(0.0, -0.2, -1.3),
+        lookfrom=vec3(0.0, 0.0, 3.2),
+        lookat=vec3(0.0, 0.0, -1.0),
         vup=vec3(0, 1, 0),
         vfov=40.0,
         defocus_angle=0.0,
-        focus_dist=8.5,
-        scene_mode='cornell_box'
+        focus_dist=3.2,
+        scene_mode='cornell_box',
+        scene_bounds=(-half - pad, -half - pad, -2.0 * half - pad, half + pad, half + pad, 0.0 + pad),
     )
 
     return spheres, materials, cam_params

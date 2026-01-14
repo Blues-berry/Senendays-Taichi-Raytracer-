@@ -5,7 +5,7 @@ import os
 import csv
 from datetime import datetime
 import main
-from main import spheres, cam, world
+from main import spheres, materials, cam, world
 import utils
 
 from typing import List, Dict, Any
@@ -102,10 +102,11 @@ benchmark_data = []
 pt_reference = None  # Will store PT reference for MSE calculation (Linear Space)
 pt_reference_linear = None  # Store linear space version for accurate MSE
 
-# Initialize GUI
-gui = ti.GUI('Raytracing Benchmark', cam.img_res, fast_gui=True)
-current_frame = ti.Vector.field(n=3, dtype=ti.f32, shape=cam.img_res)
-pt_frame = ti.Vector.field(n=3, dtype=ti.f32, shape=cam.img_res)
+# NOTE: Do not create GUI / buffers at import time.
+# `cam` is created inside run_group_experiments()/run_benchmark().
+gui = None
+current_frame = None
+pt_frame = None
 
 def log_message(message):
     """Log a message with timestamp"""
@@ -124,21 +125,15 @@ def calculate_accurate_mse(current_linear, reference_linear):
     curr_f = current_linear.astype(np.float32)
     ref_f = reference_linear.astype(np.float32)
 
-    # Normalize to [0, 1] range if needed (more robust threshold check)
-    if curr_f.max() > 255.0:
-        curr_f = curr_f / 255.0
-    if ref_f.max() > 255.0:
-        ref_f = ref_f / 255.0
-
     # Handle NaN and Inf values (robust error handling)
     curr_f = np.nan_to_num(curr_f, nan=0.0, posinf=0.0, neginf=0.0)
     ref_f = np.nan_to_num(ref_f, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Ensure values are in valid range [0, 1] after normalization
-    curr_f = np.clip(curr_f, 0.0, 1.0)
-    ref_f = np.clip(ref_f, 0.0, 1.0)
+    # IMPORTANT: compute MSE in *linear* space. Do NOT divide by 255 here.
+    # Clamp to a reasonable HDR range to avoid a single firefly dominating metrics.
+    curr_f = np.clip(curr_f, 0.0, 10.0)
+    ref_f = np.clip(ref_f, 0.0, 10.0)
 
-    # Calculate MSE in linear space
     diff = curr_f - ref_f
     mse = np.mean(diff ** 2)
     return float(mse)
@@ -201,11 +196,14 @@ def _apply_ablation_toggles(group_cfg: dict):
     # 如确实需要全局默认值，请在创建 Camera 时通过参数传入。
 
 
-def _trigger_object_movement_at_frame(frame_idx: int, trigger_frame: int = 200) -> bool:
+def _trigger_object_movement_at_frame(frame_idx: int, trigger_frame: int = -1) -> bool:
     """Move the light sphere at a deterministic frame.
 
+    NOTE: If trigger_frame < 0, movement is disabled.
     Returns True if movement was applied at this frame.
     """
+    if trigger_frame < 0:
+        return False
     if frame_idx != trigger_frame:
         return False
     if len(spheres) <= 0:
@@ -276,18 +274,27 @@ def _save_error_heatmap(group_name: str, frame_label: str, reference_spp: int = 
 
 def run_group_experiments(scene_mode='cornell_box'):
     """Run ablation study and output *four* CSV files (one per group)."""
-    global frame_count, current_mode_frames, pt_reference, pt_reference_linear, world, cam, spheres
+    global frame_count, current_mode_frames, pt_reference, pt_reference_linear, world, cam, spheres, gui, current_frame, pt_frame
 
     # Keep an optional combined plot for quick inspection
     mse_by_group = {g['name']: [] for g in EXPERIMENT_GROUPS}
 
     # Shared settings
-    movement_frame = 50
-    test_frames = 100 # Reduced from 450 to prevent timeout
+    # Disable movement by default (movement currently interferes with clean ablation curves)
+    movement_frame = -1
+    test_frames = 400
 
     for gi, g in enumerate(EXPERIMENT_GROUPS):
         group_name = g["name"]
         log_message(f"\n=== Running group {gi+1}/{len(EXPERIMENT_GROUPS)}: {group_name} ===")
+
+        # CRITICAL: benchmarks must start from a clean scene state.
+        # main.setup_scene() rebinds main.spheres/materials; ensure we don't keep polluted globals.
+        try:
+            main.spheres.clear()
+            main.materials.clear()
+        except Exception:
+            pass
 
         # 在创建 Camera 时直接传入 ablation 参数，而不是创建后修改属性
         world, cam = main.setup_scene(
@@ -300,6 +307,11 @@ def run_group_experiments(scene_mode='cornell_box'):
             neighbor_clamping_on=g.get("neighbor_clamping_on", None),
         )
         cam.scene_mode = scene_mode  # 保留场景模式设置
+
+        # (Re)create GUI + frame buffers for this camera
+        gui = ti.GUI('Raytracing Benchmark', cam.img_res, fast_gui=True)
+        current_frame = ti.Vector.field(n=3, dtype=ti.f32, shape=cam.img_res)
+        pt_frame = ti.Vector.field(n=3, dtype=ti.f32, shape=cam.img_res)
 
         # Ensure the compact light list exists when importance sampling is enabled
         try:
@@ -317,7 +329,7 @@ def run_group_experiments(scene_mode='cornell_box'):
         current_frame.fill(0.001)
 
         # (Re)adapt grid once
-        cam.adapt_grid_to_scene(spheres, verbose=False)
+        cam.adapt_grid_to_scene(spheres, verbose=False, scene_bounds=getattr(cam, 'scene_bounds', None))
 
         # Warm-up
         ti.sync()
@@ -345,9 +357,10 @@ def run_group_experiments(scene_mode='cornell_box'):
             moved_this_frame = _trigger_object_movement_at_frame(f, movement_frame)
             movement_applied_flag = movement_applied_flag or moved_this_frame
 
-            # If the scene changed, re-adapt grid (important for hybrid/grid correctness)
+            # If the scene changed, clear + re-adapt grid (important for hybrid/grid correctness)
             if moved_this_frame and COMPARE_RENDER_MODE in (RENDER_MODE_GRID, RENDER_MODE_HYBRID):
-                cam.adapt_grid_to_scene(spheres, verbose=False)
+                cam.clear_grid_data()
+                cam.adapt_grid_to_scene(spheres, verbose=False, scene_bounds=getattr(cam, 'scene_bounds', None))
 
             ti.sync()
             start_time = time.perf_counter()
@@ -488,7 +501,7 @@ def run_benchmark(scene_mode='cornell_box'):
     displacement_frame_in_mode = -1  # Track frames after displacement
 
     # Grid 初始化（setup_scene 内已经 adapt 过，这里保持一次以防后续逻辑依赖）
-    cam.adapt_grid_to_scene(spheres, verbose=True)
+    cam.adapt_grid_to_scene(spheres, verbose=True, scene_bounds=getattr(cam, 'scene_bounds', None))
     log_message(f"Grid initialized for benchmark (scene={scene_mode})")
 
     # Initialize current_frame with a small value to avoid pure black
@@ -646,7 +659,7 @@ def run_benchmark(scene_mode='cornell_box'):
 
             # Re-adapt grid for Grid and Hybrid modes
             if render_mode == RENDER_MODE_GRID or render_mode == RENDER_MODE_HYBRID:
-                cam.adapt_grid_to_scene(spheres, verbose=False)
+                cam.adapt_grid_to_scene(spheres, verbose=False, scene_bounds=getattr(cam, 'scene_bounds', None))
                 log_message("Grid re-adapted after light source movement")
 
             # Force sync so the movement + reset are visible immediately
